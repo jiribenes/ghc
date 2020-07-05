@@ -776,7 +776,7 @@ tcSpecPrag poly_id prag@(SpecSig _ fun_name hs_tys inl)
     spec_ctxt prag = hang (text "In the pragma:") 2 (ppr prag)
 
     tc_one hs_ty
-      = do { spec_ty <- tcHsSigType   (FunSigCtxt name False) hs_ty
+      = do { spec_ty <- tcLHsSigType  (FunSigCtxt name False) hs_ty
            ; wrap    <- tcSpecWrapper (FunSigCtxt name True)  poly_ty spec_ty
            ; return (SpecPrag poly_id wrap inl) }
 

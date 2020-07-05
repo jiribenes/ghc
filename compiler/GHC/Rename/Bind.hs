@@ -44,7 +44,7 @@ import GHC.Rename.Utils ( HsDocContext(..), mapFvRn, extendTyVarEnvFVRn
                         , checkDupRdrNames, warnUnusedLocalBinds
                         , checkUnusedRecordWildcard
                         , checkDupAndShadowedNames, bindLocalNamesFV
-                        , addNoNestedForallsContextsErr, checkInferredVars )
+                        , addNoNestedForallsContextsErr, checkInferredVars' )
 import GHC.Driver.Session
 import GHC.Unit.Module
 import GHC.Types.Name
@@ -973,14 +973,14 @@ renameSig ctxt sig@(ClassOpSig _ is_deflt vs ty)
                           <+> quotes (ppr v1))
 
 renameSig _ (SpecInstSig _ src ty)
-  = do  { checkInferredVars doc inf_msg ty
-        ; (new_ty, fvs) <- rnHsSigType doc TypeLevel ty
+  = do  { checkInferredVars' doc inf_msg ty
+        ; (new_ty, fvs) <- rnLHsSigType doc TypeLevel ty
           -- Check if there are any nested `forall`s or contexts, which are
           -- illegal in the type of an instance declaration (see
           -- Note [No nested foralls or contexts in instance types] in
           -- GHC.Hs.Type).
         ; addNoNestedForallsContextsErr doc (text "SPECIALISE instance type")
-            (getLHsInstDeclHead new_ty)
+            (getLHsInstDeclHead' new_ty)
         ; return (SpecInstSig noExtField src new_ty,fvs) }
   where
     doc = SpecInstSigCtx
@@ -1000,7 +1000,7 @@ renameSig ctxt sig@(SpecSig _ v tys inl)
     ty_ctxt = GenericCtx (text "a SPECIALISE signature for"
                           <+> quotes (ppr v))
     do_one (tys,fvs) ty
-      = do { (new_ty, fvs_ty) <- rnHsSigType ty_ctxt TypeLevel ty
+      = do { (new_ty, fvs_ty) <- rnLHsSigType ty_ctxt TypeLevel ty
            ; return ( new_ty:tys, fvs_ty `plusFV` fvs) }
 
 renameSig ctxt sig@(InlineSig _ v s)

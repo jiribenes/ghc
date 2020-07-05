@@ -967,7 +967,7 @@ data Sig pass
         -- For details on above see note [Api annotations] in GHC.Parser.Annotation
   | SpecSig     (XSpecSig pass)
                 (XRec pass (IdP pass)) -- Specialise a function or datatype  ...
-                [LHsSigType pass]  -- ... to these types
+                [LHsSigType' pass] -- ... to these types
                 InlinePragma       -- The pragma on SPECIALISE_INLINE form.
                                    -- If it's just defaultInlinePragma, then we said
                                    --    SPECIALISE, not SPECIALISE_INLINE
@@ -983,7 +983,7 @@ data Sig pass
         --      'GHC.Parser.Annotation.AnnInstance','GHC.Parser.Annotation.AnnClose'
 
         -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | SpecInstSig (XSpecInstSig pass) SourceText (LHsSigType pass)
+  | SpecInstSig (XSpecInstSig pass) SourceText (LHsSigType' pass)
                   -- Note [Pragma source text] in GHC.Types.Basic
 
         -- | A minimal complete definition pragma

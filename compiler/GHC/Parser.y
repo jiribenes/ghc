@@ -93,6 +93,9 @@ import GHC.Builtin.Types ( unitTyCon, unitDataCon, tupleTyCon, tupleDataCon, nil
                            unboxedUnitTyCon, unboxedUnitDataCon,
                            listTyCon_RDR, consDataCon_RDR, eqTyCon_RDR,
                            manyDataConTyCon)
+
+-- other
+import qualified GHC.LanguageExtensions as LangExt
 }
 
 %expect 232 -- shift/reduce conflicts
@@ -1143,7 +1146,7 @@ ty_decl :: { LTyClDecl GhcPs }
 
 -- standalone kind signature
 standalone_kind_sig :: { LStandaloneKindSig GhcPs }
-  : 'type' sks_vars '::' ktype
+  : 'type' sks_vars '::' sigktype2
       {% amms (mkStandaloneKindSig (comb2 $1 $4) $2 $4)
               [mj AnnType $1,mu AnnDcolon $3] }
 
@@ -1173,7 +1176,7 @@ inst_decl :: { LInstDecl GhcPs }
                     (mj AnnType $1:mj AnnInstance $2:(fst $ unLoc $3)) }
 
           -- data/newtype instance declaration
-        | data_or_newtype 'instance' capi_ctype tycl_hdr_inst constrs
+        | data_or_newtype 'instance' capi_ctype datafam_inst_hdr constrs
                           maybe_derivings
             {% amms (mkDataFamInst (comb4 $1 $4 $5 $6) (snd $ unLoc $1) $3 (snd $ unLoc $4)
                                       Nothing (reverse (snd  $ unLoc $5))
@@ -1181,7 +1184,7 @@ inst_decl :: { LInstDecl GhcPs }
                     ((fst $ unLoc $1):mj AnnInstance $2:(fst $ unLoc $4)++(fst $ unLoc $5)) }
 
           -- GADT instance declaration
-        | data_or_newtype 'instance' capi_ctype tycl_hdr_inst opt_kind_sig
+        | data_or_newtype 'instance' capi_ctype datafam_inst_hdr opt_kind_sig
                  gadt_constrlist
                  maybe_derivings
             {% amms (mkDataFamInst (comb4 $1 $4 $6 $7) (snd $ unLoc $1) $3 (snd $ unLoc $4)
@@ -1272,13 +1275,13 @@ ty_fam_inst_eqns :: { Located [LTyFamInstEqn GhcPs] }
 
 ty_fam_inst_eqn :: { Located ([AddAnn],TyFamInstEqn GhcPs) }
         : 'forall' tv_bndrs '.' type '=' ktype
-              {% do { hintExplicitForall $1
+              {% do { hintExplicitForall LangExt.RankNTypes $1
                     ; tvb <- fromSpecTyVarBndrs $2
-                    ; (eqn,ann) <- mkTyFamInstEqn (Just tvb) $4 $6
+                    ; (eqn,ann) <- mkTyFamInstEqn (mkHsOuterExplicit tvb) $4 $6
                     ; return (sLL $1 $>
                                (mu AnnForall $1:mj AnnDot $3:mj AnnEqual $5:ann,eqn)) } }
         | type '=' ktype
-              {% do { (eqn,ann) <- mkTyFamInstEqn Nothing $1 $3
+              {% do { (eqn,ann) <- mkTyFamInstEqn mkHsOuterImplicit $1 $3
                     ; return (sLL $1 $> (mj AnnEqual $2:ann, eqn))  } }
               -- Note the use of type for the head; this allows
               -- infix type constructors and type patterns
@@ -1344,14 +1347,14 @@ at_decl_inst :: { LInstDecl GhcPs }
                         (mj AnnType $1:$2++(fst $ unLoc $3)) }
 
         -- data/newtype instance declaration, with optional 'instance' keyword
-        | data_or_newtype opt_instance capi_ctype tycl_hdr_inst constrs maybe_derivings
+        | data_or_newtype opt_instance capi_ctype datafam_inst_hdr constrs maybe_derivings
                {% amms (mkDataFamInst (comb4 $1 $4 $5 $6) (snd $ unLoc $1) $3 (snd $ unLoc $4)
                                     Nothing (reverse (snd $ unLoc $5))
                                             (fmap reverse $6))
                        ((fst $ unLoc $1):$2++(fst $ unLoc $4)++(fst $ unLoc $5)) }
 
         -- GADT instance declaration, with optional 'instance' keyword
-        | data_or_newtype opt_instance capi_ctype tycl_hdr_inst opt_kind_sig
+        | data_or_newtype opt_instance capi_ctype datafam_inst_hdr opt_kind_sig
                  gadt_constrlist
                  maybe_derivings
                 {% amms (mkDataFamInst (comb4 $1 $4 $6 $7) (snd $ unLoc $1) $3
@@ -1402,23 +1405,23 @@ tycl_hdr :: { Located (Maybe (LHsContext GhcPs), LHsType GhcPs) }
                                     }
         | type                      { sL1 $1 (Nothing, $1) }
 
-tycl_hdr_inst :: { Located ([AddAnn],(Maybe (LHsContext GhcPs), Maybe [LHsTyVarBndr () GhcPs], LHsType GhcPs)) }
-        : 'forall' tv_bndrs '.' context '=>' type   {% hintExplicitForall $1
+datafam_inst_hdr :: { Located ([AddAnn],(Maybe (LHsContext GhcPs), HsOuterFamEqnTyVarBndrs GhcPs, LHsType GhcPs)) }
+        : 'forall' tv_bndrs '.' context '=>' type   {% hintExplicitForall LangExt.RankNTypes $1
                                                        >> fromSpecTyVarBndrs $2
                                                          >>= \tvbs -> (addAnnotation (gl $4) (toUnicodeAnn AnnDarrow $5) (gl $5)
                                                              >> return (sLL $1 $> ([mu AnnForall $1, mj AnnDot $3]
-                                                                                  , (Just $4, Just tvbs, $6)))
+                                                                                  , (Just $4, mkHsOuterExplicit tvbs, $6)))
                                                           )
                                                     }
-        | 'forall' tv_bndrs '.' type   {% do { hintExplicitForall $1
+        | 'forall' tv_bndrs '.' type   {% do { hintExplicitForall LangExt.RankNTypes $1
                                              ; tvbs <- fromSpecTyVarBndrs $2
                                              ; return (sLL $1 $> ([mu AnnForall $1, mj AnnDot $3]
-                                                                 , (Nothing, Just tvbs, $4)))
+                                                                 , (Nothing, mkHsOuterExplicit tvbs, $4)))
                                        } }
         | context '=>' type         {% addAnnotation (gl $1) (toUnicodeAnn AnnDarrow $2) (gl $2)
-                                       >> (return (sLL $1 $>([], (Just $1, Nothing, $3))))
+                                       >> (return (sLL $1 $>([], (Just $1, mkHsOuterImplicit, $3))))
                                     }
-        | type                      { sL1 $1 ([], (Nothing, Nothing, $1)) }
+        | type                      { sL1 $1 ([], (Nothing, mkHsOuterImplicit, $1)) }
 
 
 capi_ctype :: { Maybe (Located CType) }
@@ -1713,7 +1716,7 @@ rule_explicit_activation :: { ([AddAnn]
 
 rule_foralls :: { ([AddAnn], Maybe [LHsTyVarBndr () GhcPs], [LRuleBndr GhcPs]) }
         : 'forall' rule_vars '.' 'forall' rule_vars '.'    {% let tyvs = mkRuleTyVarBndrs $2
-                                                              in hintExplicitForall $1
+                                                              in hintExplicitForall LangExt.RankNTypes $1
                                                               >> checkRuleTyVarBndrNames (mkRuleTyVarBndrs $2)
                                                               >> return ([mu AnnForall $1,mj AnnDot $3,
                                                                           mu AnnForall $4,mj AnnDot $6],
@@ -1846,12 +1849,12 @@ safety :: { Located Safety }
         | 'interruptible'               { sLL $1 $> PlayInterruptible }
 
 fspec :: { Located ([AddAnn]
-                    ,(Located StringLiteral, Located RdrName, LHsSigType GhcPs)) }
-       : STRING var '::' sigtype        { sLL $1 $> ([mu AnnDcolon $3]
+                    ,(Located StringLiteral, Located RdrName, LHsSigType' GhcPs)) }
+       : STRING var '::' sigtype2       { sLL $1 $> ([mu AnnDcolon $3]
                                              ,(L (getLoc $1)
-                                                    (getStringLiteral $1), $2, mkLHsSigType $4)) }
-       |        var '::' sigtype        { sLL $1 $> ([mu AnnDcolon $2]
-                                             ,(noLoc (StringLiteral NoSourceText nilFS), $1, mkLHsSigType $3)) }
+                                                    (getStringLiteral $1), $2, $4)) }
+       |        var '::' sigtype2       { sLL $1 $> ([mu AnnDcolon $2]
+                                             ,(noLoc (StringLiteral NoSourceText nilFS), $1, $3)) }
          -- if the entity string is missing, it defaults to the empty string;
          -- the meaning of an empty entity string depends on the calling
          -- convention
@@ -1867,8 +1870,36 @@ opt_tyconsig :: { ([AddAnn], Maybe (Located RdrName)) }
              : {- empty -}              { ([], Nothing) }
              | '::' gtycon              { ([mu AnnDcolon $1], Just $2) }
 
+-- TODO RGS: Delete this
 sigtype :: { LHsType GhcPs }
         : ctype                            { $1 }
+
+-- TODO RGS: Docs
+-- TODO RGS: Rename to sigktype for symmetry with sigtype
+sigktype2 :: { LHsSigType' GhcPs }
+        : sigtype2             { $1 }
+        | ctype '::' kind      {% ams (sLL $1 $> $ mkHsImplicitSigType $
+                                       sLL $1 $> $ HsKindSig noExtField $1 $3)
+                                      [mu AnnDcolon $2] }
+
+-- TODO RGS: Docs
+-- TODO RGS: This is the REAL sigtype production. Delete the one above (and rename this) when ready
+sigtype2 :: { LHsSigType' GhcPs }
+        : forall_telescope ctype      {% let (forall_tok, forall_anns, forall_tele) = unLoc $1 in
+                                         hintExplicitForall LangExt.ScopedTypeVariables forall_tok
+                                         >> ams (sLL $1 $> $
+                                                 mkHsExplicitSigType forall_tele $2)
+                                                forall_anns }
+        | context '=>' ctype          {% do { addAnnotation (gl $1) (toUnicodeAnn AnnDarrow $2) (gl $2)
+                                            ; return $
+                                                sLL $1 $> $ mkHsImplicitSigType $
+                                                sLL $1 $> $ HsQualTy { hst_ctxt = $1
+                                                                     , hst_xqual = noExtField
+                                                                     , hst_body = $3 }}}
+        | ipvar '::' type             {% ams (sLL $1 $> $ mkHsImplicitSigType $
+                                              sLL $1 $> $ HsIParamTy noExtField $1 $3)
+                                             [mu AnnDcolon $2] }
+        | type                        { sL1 $1 $ mkHsImplicitSigType $1 }
 
 sig_vars :: { Located [Located RdrName] }    -- Returned in reversed order
          : sig_vars ',' var           {% addAnnotation (gl $ head $ unLoc $1)
@@ -1876,10 +1907,17 @@ sig_vars :: { Located [Located RdrName] }    -- Returned in reversed order
                                          >> return (sLL $1 $> ($3 : unLoc $1)) }
          | var                        { sL1 $1 [$1] }
 
+-- TODO RGS: Delete this
 sigtypes1 :: { (OrdList (LHsSigType GhcPs)) }
    : sigtype                 { unitOL (mkLHsSigType $1) }
    | sigtype ',' sigtypes1   {% addAnnotation (gl $1) AnnComma (gl $2)
                                 >> return (unitOL (mkLHsSigType $1) `appOL` $3) }
+
+-- TODO RGS: This is the REAL sigtypes1. Delete the one above when ready.
+sigtypes1_2 :: { (OrdList (LHsSigType' GhcPs)) }
+   : sigtype2                { unitOL $1 }
+   | sigtype2 ',' sigtypes1_2 {% addAnnotation (gl $1) AnnComma (gl $2)
+                                >> return (unitOL $1 `appOL` $3) }
 
 -----------------------------------------------------------------------------
 -- Types
@@ -1888,15 +1926,15 @@ unpackedness :: { Located UnpackednessPragma }
         : '{-# UNPACK' '#-}'   { sLL $1 $> (UnpackednessPragma [mo $1, mc $2] (getUNPACK_PRAGs $1) SrcUnpack) }
         | '{-# NOUNPACK' '#-}' { sLL $1 $> (UnpackednessPragma [mo $1, mc $2] (getNOUNPACK_PRAGs $1) SrcNoUnpack) }
 
-forall_telescope :: { Located ([AddAnn], HsForAllTelescope GhcPs) }
-        : 'forall' tv_bndrs '.'  {% do { hintExplicitForall $1
-                                       ; pure $ sLL $1 $>
-                                           ( [mu AnnForall $1, mu AnnDot $3]
-                                           , mkHsForAllInvisTele $2 ) }}
-        | 'forall' tv_bndrs '->' {% do { hintExplicitForall $1
-                                       ; req_tvbs <- fromSpecTyVarBndrs $2
+forall_telescope :: { Located (Located Token, [AddAnn], HsForAllTelescope GhcPs) }
+        : 'forall' tv_bndrs '.'  { sLL $1 $>
+                                     ( $1
+                                     , [mu AnnForall $1, mu AnnDot $3]
+                                     , mkHsForAllInvisTele $2 ) }
+        | 'forall' tv_bndrs '->' {% do { req_tvbs <- fromSpecTyVarBndrs $2
                                        ; pure $ sLL $1 $> $
-                                           ( [mu AnnForall $1, mu AnnRarrow $3]
+                                           ( $1
+                                           , [mu AnnForall $1, mu AnnRarrow $3]
                                            , mkHsForAllVisTele req_tvbs ) }}
 
 -- A ktype is a ctype, possibly with a kind annotation
@@ -1907,12 +1945,13 @@ ktype :: { LHsType GhcPs }
 
 -- A ctype is a for-all type
 ctype   :: { LHsType GhcPs }
-        : forall_telescope ctype      {% let (forall_anns, forall_tele) = unLoc $1 in
-                                         ams (sLL $1 $> $
-                                              HsForAllTy { hst_tele = forall_tele
-                                                         , hst_xforall = noExtField
-                                                         , hst_body = $2 })
-                                             forall_anns }
+        : forall_telescope ctype      {% let (forall_tok, forall_anns, forall_tele) = unLoc $1 in
+                                         hintExplicitForall LangExt.RankNTypes forall_tok
+                                         >> ams (sLL $1 $> $
+                                                 HsForAllTy { hst_tele = forall_tele
+                                                            , hst_xforall = noExtField
+                                                            , hst_body = $2 })
+                                                forall_anns }
         | context '=>' ctype          {% addAnnotation (gl $1) (toUnicodeAnn AnnDarrow $2) (gl $2)
                                          >> return (sLL $1 $> $
                                             HsQualTy { hst_ctxt = $1
@@ -2058,8 +2097,16 @@ atype :: { LHsType GhcPs }
 -- An inst_type is what occurs in the head of an instance decl
 --      e.g.  (Foo a, Gaz b) => Wibble a b
 -- It's kept as a single type for convenience.
+-- TODO RGS: Delete this
 inst_type :: { LHsSigType GhcPs }
         : sigtype                       { mkLHsSigType $1 }
+
+-- An inst_type is what occurs in the head of an instance decl
+--      e.g.  (Foo a, Gaz b) => Wibble a b
+-- It's kept as a single type for convenience.
+-- TODO RGS: This is the REAL inst_type. Delete the one above when ready.
+inst_type2 :: { LHsSigType' GhcPs }
+        : sigtype2                      { $1 }
 
 deriv_types :: { [LHsSigType GhcPs] }
         : ktype                         { [mkLHsSigType $1] }
@@ -2181,7 +2228,7 @@ gadt_constrs :: { Located [LConDecl GhcPs] }
 gadt_constr :: { LConDecl GhcPs }
     -- see Note [Difference in parsing GADT and data constructors]
     -- Returns a list because of:   C,D :: ty
-        : optSemi con_list '::' sigtype
+        : optSemi con_list '::' sigtype2
                 {% do { decl <- mkGadtDecl (unLoc $2) $4
                       ; ams (sLL $2 $> decl)
                             [mu AnnDcolon $3] } }
@@ -2407,20 +2454,20 @@ sigdecl :: { LHsDecl GhcPs }
                 ; ams (sLL $1 $> (SigD noExtField (SCCFunSig noExtField (getSCC_PRAGs $1) $2 (Just ( sL1 $3 str_lit)))))
                       [mo $1, mc $4] } }
 
-        | '{-# SPECIALISE' activation qvar '::' sigtypes1 '#-}'
+        | '{-# SPECIALISE' activation qvar '::' sigtypes1_2 '#-}'
              {% ams (
                  let inl_prag = mkInlinePragma (getSPEC_PRAGs $1)
                                              (NoUserInline, FunLike) (snd $2)
                   in sLL $1 $> $ SigD noExtField (SpecSig noExtField $3 (fromOL $5) inl_prag))
                     (mo $1:mu AnnDcolon $4:mc $6:(fst $2)) }
 
-        | '{-# SPECIALISE_INLINE' activation qvar '::' sigtypes1 '#-}'
+        | '{-# SPECIALISE_INLINE' activation qvar '::' sigtypes1_2 '#-}'
              {% ams (sLL $1 $> $ SigD noExtField (SpecSig noExtField $3 (fromOL $5)
                                (mkInlinePragma (getSPEC_INLINE_PRAGs $1)
                                                (getSPEC_INLINE $1) (snd $2))))
                        (mo $1:mu AnnDcolon $4:mc $6:(fst $2)) }
 
-        | '{-# SPECIALISE' 'instance' inst_type '#-}'
+        | '{-# SPECIALISE' 'instance' inst_type2 '#-}'
                 {% ams (sLL $1 $>
                                   $ SigD noExtField (SpecInstSig noExtField (getSPEC_PRAGs $1) $3))
                        [mo $1,mj AnnInstance $2,mc $4] }
@@ -3837,13 +3884,14 @@ hintMultiWayIf span = do
     text "Multi-way if-expressions need MultiWayIf turned on"
 
 -- Hint about explicit-forall
-hintExplicitForall :: Located Token -> P ()
-hintExplicitForall tok = do
+hintExplicitForall :: LangExt.Extension -> Located Token -> P ()
+hintExplicitForall suggested_ext tok = do
     forall   <- getBit ExplicitForallBit
     rulePrag <- getBit InRulePragBit
     unless (forall || rulePrag) $ addError (getLoc tok) $ vcat
       [ text "Illegal symbol" <+> quotes forallSymDoc <+> text "in type"
-      , text "Perhaps you intended to use RankNTypes or a similar language"
+      , text "Perhaps you intended to use" <+> text (show suggested_ext)
+          <+> text "or a similar language"
       , text "extension to enable explicit-forall syntax:" <+>
         forallSymDoc <+> text "<tvs>. <type>"
       ]
