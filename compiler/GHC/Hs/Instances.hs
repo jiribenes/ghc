@@ -128,6 +128,11 @@ deriving instance Data (TyClDecl GhcPs)
 deriving instance Data (TyClDecl GhcRn)
 deriving instance Data (TyClDecl GhcTc)
 
+-- deriving instance (DataIdLR p p) => Data (FunDep p)
+deriving instance Data (FunDep GhcPs)
+deriving instance Data (FunDep GhcRn)
+deriving instance Data (FunDep GhcTc)
+
 -- deriving instance (DataIdLR p p) => Data (TyClGroup p)
 deriving instance Data (TyClGroup GhcPs)
 deriving instance Data (TyClGroup GhcRn)
@@ -468,7 +473,12 @@ deriving instance Eq (IE GhcPs)
 deriving instance Eq (IE GhcRn)
 deriving instance Eq (IE GhcTc)
 
-
 -- ---------------------------------------------------------------------
 
 deriving instance Data XXExprGhcTc
+
+-- ---------------------------------------------------------------------
+
+deriving instance Data XViaStrategyPs
+
+-- ---------------------------------------------------------------------

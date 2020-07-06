@@ -14,6 +14,7 @@ import GHC.Utils.Outputable ( SDoc, Outputable )
 import {-# SOURCE #-} GHC.Hs.Pat  ( LPat )
 import GHC.Types.Basic  ( SpliceExplicitFlag(..))
 import GHC.Hs.Extension ( OutputableBndrId, GhcPass, XRec )
+import GHC.Parser.Annotation ( LocatedA )
 import Data.Kind  ( Type )
 
 type role HsExpr nominal
@@ -32,6 +33,8 @@ instance OutputableBndrId p => Outputable (HsExpr (GhcPass p))
 instance OutputableBndrId p => Outputable (HsCmd (GhcPass p))
 
 type LHsExpr a = XRec a (HsExpr a)
+-- type LHsExpr a = LocatedA (HsExpr a)
+                       -- AZ: old one
 
 pprLExpr :: (OutputableBndrId p) => LHsExpr (GhcPass p) -> SDoc
 
