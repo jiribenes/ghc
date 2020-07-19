@@ -169,6 +169,7 @@ tcGRHSsPat grhss res_ty
       -- desugar to incorrect code.
     tcGRHSs match_ctxt grhss res_ty
   where
+    match_ctxt :: TcMatchCtxt HsExpr -- AZ
     match_ctxt = MC { mc_what = PatBindRhs,
                       mc_body = tcBody }
 
@@ -179,11 +180,11 @@ tcGRHSsPat grhss res_ty
 ********************************************************************* -}
 
 data TcMatchCtxt body   -- c.f. TcStmtCtxt, also in this module
-  = MC { mc_what :: HsMatchContext GhcRn,  -- What kind of thing this is
-         mc_body :: Located (body GhcRn)   -- Type checker for a body of
+  = MC { mc_what :: HsMatchContext Name,   -- What kind of thing this is
+         mc_body :: LocatedA (body GhcRn)  -- Type checker for a body of
                                            -- an alternative
                  -> ExpRhoType
-                 -> TcM (Located (body GhcTc)) }
+                 -> TcM (LocatedA (body GhcTc)) }
 
 -- | Type-check a MatchGroup.
 tcMatches :: (Outputable (body GhcRn)) => TcMatchCtxt body
@@ -251,13 +252,13 @@ tcGRHSs :: TcMatchCtxt body -> GRHSs GhcRn (LocatedA (body GhcRn)) -> ExpRhoType
 -- We used to force it to be a monotype when there was more than one guard
 -- but we don't need to do that any more
 
-tcGRHSs ctxt (GRHSs _ grhss (L l binds)) res_ty
+tcGRHSs ctxt (GRHSs _ grhss binds) res_ty
   = do  { (binds', ugrhss)
             <- tcLocalBinds binds $
                mapM (tcCollectingUsage . wrapLocM (tcGRHS ctxt res_ty)) grhss
         ; let (usages, grhss') = unzip ugrhss
         ; tcEmitBindingUsage $ supUEs usages
-        ; return (GRHSs noAnn grhss' (L l binds')) }
+        ; return (GRHSs noAnn grhss' binds') }
 
 -------------
 tcGRHS :: TcMatchCtxt body -> ExpRhoType -> GRHS GhcRn (LocatedA (body GhcRn))
@@ -357,11 +358,11 @@ tcStmtsAndThen _ _ [] res_ty thing_inside
         ; return ([], thing) }
 
 -- LetStmts are handled uniformly, regardless of context
-tcStmtsAndThen ctxt stmt_chk (L loc (LetStmt x (L l binds)) : stmts)
+tcStmtsAndThen ctxt stmt_chk (L loc (LetStmt x binds) : stmts)
                                                              res_ty thing_inside
   = do  { (binds', (stmts',thing)) <- tcLocalBinds binds $
               tcStmtsAndThen ctxt stmt_chk stmts res_ty thing_inside
-        ; return (L loc (LetStmt x (L l binds')) : stmts', thing) }
+        ; return (L loc (LetStmt x binds') : stmts', thing) }
 
 -- Don't set the error context for an ApplicativeStmt.  It ought to be
 -- possible to do this with a popErrCtxt in the tcStmt case for

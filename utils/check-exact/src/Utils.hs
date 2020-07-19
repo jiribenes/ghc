@@ -192,7 +192,7 @@ isPointSrcSpan ss = spanLength ss == 0
 
 -- |Given a list of items and a list of keys, returns a list of items
 -- ordered by their position in the list of keys.
-orderByKey :: [(SrcSpan,a)] -> [SrcSpan] -> [(SrcSpan,a)]
+orderByKey :: [(RealSrcSpan,a)] -> [RealSrcSpan] -> [(RealSrcSpan,a)]
 orderByKey keys order
     -- AZ:TODO: if performance becomes a problem, consider a Map of the order
     -- SrcSpan to an index, and do a lookup instead of elemIndex.

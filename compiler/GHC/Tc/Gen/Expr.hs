@@ -134,7 +134,7 @@ tcPolyExprNC (L loc expr) res_ty
         set_loc_and_ctxt l e m = do
           inGenCode <- inGeneratedCode
           if inGenCode && not (isGeneratedSrcSpan l)
-            then setSrcSpan l $ addExprCtxt (L l e) m
+            then setSrcSpan l $ addExprCtxt (L (noAnnSrcSpan l) e) m
             else setSrcSpan l m
 
 ---------------
@@ -196,7 +196,7 @@ tcLExpr, tcLExprNC
     -> TcM (LHsExpr GhcTc)
 
 tcLExpr expr res_ty
-  = setSrcSpan (getLoc expr) $ addExprCtxt expr (tcLExprNC expr res_ty)
+  = setSrcSpanA (getLoc expr) $ addExprCtxt expr (tcLExprNC expr res_ty)
 
 tcLExprNC (L loc expr) res_ty
   = setSrcSpanA loc $
@@ -565,10 +565,10 @@ tcExpr (ExplicitList _ witness exprs) res_ty
 ************************************************************************
 -}
 
-tcExpr (HsLet x (L l binds) expr) res_ty
+tcExpr (HsLet x binds expr) res_ty
   = do  { (binds', expr') <- tcLocalBinds binds $
                              tcLExpr expr res_ty
-        ; return (HsLet x (L l binds') expr') }
+        ; return (HsLet x binds' expr') }
 
 tcExpr (HsCase x scrut matches) res_ty
   = do  {  -- We used to typecheck the case alternatives first.

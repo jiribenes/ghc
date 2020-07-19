@@ -1807,7 +1807,7 @@ lookupQualifiedDoName ctxt std_name
 --   if no suitable name is found in the environment.
 --
 -- 'Nothing' really is "reserved" and means that rebindable syntax is off.
-lookupRebound :: FastString -> RnM (Maybe (Located Name))
+lookupRebound :: FastString -> RnM (Maybe (LocatedN Name))
 lookupRebound nameStr = do
   rebind <- xoptM LangExt.RebindableSyntax
   if rebind
@@ -1815,12 +1815,12 @@ lookupRebound nameStr = do
     -- we could lookup all the names we will ever care about just once
     -- at the beginning and stick them in the environment, possibly
     -- populating that "cache" lazily too.
-    then (\nm -> Just (L (nameSrcSpan nm) nm)) <$>
+    then (\nm -> Just (L (noAnnSrcSpan $ nameSrcSpan nm) nm)) <$>
          lookupOccRn (mkVarUnqual nameStr)
     else pure Nothing
 
 -- | Lookup an @ifThenElse@ binding (see 'lookupRebound').
-lookupReboundIf :: RnM (Maybe (Located Name))
+lookupReboundIf :: RnM (Maybe (LocatedN Name))
 lookupReboundIf = lookupRebound reboundIfSymbol
 
 -- Error messages

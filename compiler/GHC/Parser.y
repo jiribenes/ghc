@@ -1654,27 +1654,30 @@ decllist :: { Located (AnnList,Located (OrdList (LHsDecl GhcPs))) }
 
 -- Binding groups other than those of class and instance declarations
 --
-binds   ::  { LHsLocalBinds GhcPs }
+binds   ::  { Located (HsLocalBinds GhcPs) }
                                          -- May have implicit parameters
                                                 -- No type declarations
         : decllist          {% do { val_binds <- cvBindGroup (unLoc $ snd $ unLoc $1)
-                                  ; return (L (SrcSpanAnn (ApiAnn (glR $1) (fst $ unLoc $1) []) (gl $1))
-                                              $ HsValBinds (ApiAnn (glR $1) NoApiAnns []) val_binds) } }
+                                  ; return (sL1 $1
+                                              $ HsValBinds (ApiAnn (glR $1) (fst $ unLoc $1) []) val_binds) } }
+                                  -- ; return (L (SrcSpanAnn (ApiAnn (glR $1) (fst $ unLoc $1) []) (gl $1))
+                                  --             $ HsValBinds (ApiAnn (glR $1) (AnnList Nothing Nothing [] []) []) val_binds) } }
 
-        | '{'            dbinds '}'     {% acsa (\cs -> (L (SrcSpanAnn (ApiAnn (glR $1) (AnnList (Just $ moc $1) (Just $ mcc $3) [] []) cs) (comb3 $1 $2 $3)) 
-                                             $ HsIPBinds noExtField (IPBinds noExtField (reverse $ unLoc $2)))) }
+        | '{'            dbinds '}'     {% acs (\cs -> (L (comb3 $1 $2 $3)
+                                             $ HsIPBinds (ApiAnn (glR $1) (AnnList (Just $ moc $1) (Just $ mcc $3) [] []) cs) (IPBinds noExtField (reverse $ unLoc $2)))) }
 
-        |     vocurly    dbinds close   {% acsa (\cs -> (L (SrcSpanAnn (ApiAnn (glR $1) (AnnList Nothing Nothing [] []) cs) (gl $2)) 
-                                             $ HsIPBinds noExtField (IPBinds noExtField (reverse $ unLoc $2)))) }
+        |     vocurly    dbinds close   {% acs (\cs -> (L (gl $2)
+                                             $ HsIPBinds (ApiAnn (glR $1) (AnnList Nothing Nothing [] []) cs) (IPBinds noExtField (reverse $ unLoc $2)))) }
 
 
-wherebinds :: { LHsLocalBinds GhcPs }
+wherebinds :: { Maybe (Located (HsLocalBinds GhcPs)) }
                                                 -- May have implicit parameters
                                                 -- No type declarations
-        : 'where' binds                 {% do { let { SrcSpanAnn (ApiAnn a (AnnList o c r t) cs) l = getLoc $2 }
-                                              ; let { ann' = AnnList o c (mj AnnWhere $1:r) t }
-                                              ; acsa (\cs' -> (L (SrcSpanAnn (ApiAnn (glR $1) ann' (cs'++cs)) (comb2 $1 (L l ()))) (unLoc $2))) }}
-        | {- empty -}                   { noLocA emptyLocalBinds }
+        -- : 'where' binds                 {% do { let { SrcSpanAnn (ApiAnn a (AnnList o c r t) cs) l = getLoc $2 }
+        --                                       ; let { ann' = AnnList o c (mj AnnWhere $1:r) t }
+        --                                       ; Just <$> acsa (\cs' -> (L (SrcSpanAnn (ApiAnn (glR $1) ann' (cs'++cs)) (comb2 $1 (L l ()))) (unLoc $2))) }}
+        : 'where' binds                 { Just (sLL $1 $> (annBinds (mj AnnWhere $1) (unLoc $2))) }
+        | {- empty -}                   { Nothing }
 
 -----------------------------------------------------------------------------
 -- Transformation Rules
@@ -2358,12 +2361,12 @@ decl    :: { LHsDecl GhcPs }
 
 rhs     :: { Located (GRHSs GhcPs (LHsExpr GhcPs)) }
         : '=' exp wherebinds    {% runPV (unECP $2) >>= \ $2 ->
-                                  do { let loc = (comb3 $1 (reLoc $2) (reLoc $3))
+                                  do { let loc = (comb3 $1 (reLoc $2) (adaptWhereBinds $3))
                                      ; acs (\cs ->
                                        sL loc (GRHSs (ApiAnn (rs loc) (mj AnnEqual $1) cs) (unguardedRHS (ApiAnn (rs loc) (GrhsAnn Nothing (mj AnnEqual $1)) []) loc $2)
-                                                      $3)) } }
-        | gdrhs wherebinds      { sLL $1 (reLoc $>)
-                                    (GRHSs noAnn (reverse (unLoc $1)) $2) }
+                                                      (unLoc $ (adaptWhereBinds $3)))) } }
+        | gdrhs wherebinds      { sL (comb2 $1 (adaptWhereBinds $>))
+                                    (GRHSs noAnn (reverse (unLoc $1)) (unLoc $ (adaptWhereBinds $2))) }
 
 gdrhs :: { Located [LGRHS GhcPs (LHsExpr GhcPs)] }
         : gdrhs gdrh            { sLL $1 $> ($2 : unLoc $1) }
@@ -2383,9 +2386,9 @@ sigdecl :: { LHsDecl GhcPs }
                                   TypeSig (ApiAnn (glAR $1) [mu AnnDcolon $2] noCom) [v] (mkLHsSigWcType $3))} }
 
         | var ',' sig_vars '::' sigtype
-           {% do { let sig cs = TypeSig (ApiAnn (glNR $1) [mu AnnDcolon $4] cs) ($1 : reverse (unLoc $3))
-                                     (mkLHsSigWcType $5)
-                 ; addAnnotationS (glN $1) AnnComma (gl $2)
+           {% do { v <- addTrailingCommaN $1 (gl $2)
+                 ; let sig cs = TypeSig (ApiAnn (glNR $1) [mu AnnDcolon $4] cs) (v : reverse (unLoc $3))
+                                      (mkLHsSigWcType $5)
                  ; acsA (\cs -> sLL (reLocN $1) (reLoc $>) $ SigD noExtField (sig cs) ) }}
 
         | infix prec ops
@@ -2644,10 +2647,10 @@ aexp    :: { ECP }
                                          $ Match { m_ext = ApiAnn (glR $1) [mj AnnLam $1] cs
                                                  , m_ctxt = LambdaExpr
                                                  , m_pats = $2:$3
-                                                 , m_grhss = unguardedGRHSs $5 (ApiAnn (glAR $5) (mu AnnRarrow $4) []) }])) }
+                                                 , m_grhss = unguardedGRHSs $5 (ApiAnn (glR $4) (mu AnnRarrow $4) []) }])) }
         | 'let' binds 'in' exp          {  ECP $
                                            unECP $4 >>= \ $4 ->
-                                           mkHsLetPV (comb2A $1 $>) $2 $4
+                                           mkHsLetPV (comb2A $1 $>) (unLoc $2) $4
                                                  [mj AnnLet $1,mj AnnIn $3] }
         | '\\' 'lcase' altslist
             {  ECP $ $3 >>= \ $3 ->
@@ -2699,8 +2702,8 @@ aexp1   :: { ECP }
         : aexp1 '{' fbinds '}' { ECP $
                                   unECP $1 >>= \ $1 ->
                                   $3 >>= \ $3 ->
-                                  mkHsRecordPV (comb2 (reLoc $1) $>) (comb2 $2 $4) $1 (snd $3)
-                                        (moc $2:mcc $4:(fst $3)) }
+                                  mkHsRecordPV (comb2 (reLoc $1) $>) (comb2 $2 $4) $1 $3
+                                        [moc $2,mcc $4] }
         | aexp2                { $1 }
 
 aexp2   :: { ECP }
@@ -2850,8 +2853,8 @@ tup_exprs :: { forall b. DisambECP b => PV ([AddApiAnn],SumOrTuple b) }
            : texp commas_tup_tail
                            { unECP $1 >>= \ $1 ->
                              $2 >>= \ $2 ->
-                             do { t <- amsA (sL1 $1 (Just $1)) [AddCommaAnn (rs $ fst $2)]
-                                ; return ([],Tuple (t : snd $2)) } }
+                             do { t <- amsA $1 [AddCommaAnn (rs $ fst $2)]
+                                ; return ([],Tuple (sL1 $1 (Just t) : snd $2)) } }
 
            | texp bars   { unECP $1 >>= \ $1 -> return $
                             (mvbars (fst $2), Sum 1  (snd $2 + 1) $1) }
@@ -3067,7 +3070,7 @@ alt     :: { forall b. DisambECP b => PV (LMatch GhcPs (LocatedA b)) }
 
 alt_rhs :: { forall b. DisambECP b => PV (Located (GRHSs GhcPs (LocatedA b))) }
         : ralt wherebinds           { $1 >>= \alt ->
-                                      return $ sLL alt (reLoc $>) (GRHSs noAnn (unLoc alt) $2) }
+                                      return $ sLL alt (adaptWhereBinds $>) (GRHSs noAnn (unLoc alt) (unLoc $ adaptWhereBinds $2)) }
 
 ralt :: { forall b. DisambECP b => PV (Located [LGRHS GhcPs (LocatedA b)]) }
         : '->' exp            { unECP $2 >>= \ $2 ->
@@ -3174,25 +3177,25 @@ qual  :: { forall b. DisambECP b => PV (LStmt GhcPs (LocatedA b)) }
                                             $ mkPsBindStmt (ApiAnn (glAR $1) [mu AnnLarrow $2] cs) $1 $3) }
     | exp                                { unECP $1 >>= \ $1 ->
                                            return $ sL1 $1 $ mkBodyStmt $1 }
-    | 'let' binds                        { acsA (\cs -> (sLL $1 (reLoc $>)
-                                                $ mkLetStmt (ApiAnn (glR $1) [mj AnnLet $1] cs) $2)) }
+    | 'let' binds                        { acsA (\cs -> (sLL $1 $>
+                                                $ mkLetStmt (ApiAnn (glR $1) [mj AnnLet $1] cs) (unLoc $2))) }
 
 -----------------------------------------------------------------------------
 -- Record Field Update/Construction
 
-fbinds  :: { forall b. DisambECP b => PV ([AddApiAnn],([LHsRecField GhcPs (LocatedA b)], Maybe SrcSpan)) }
+fbinds  :: { forall b. DisambECP b => PV ([LHsRecField GhcPs (LocatedA b)], Maybe SrcSpan) }
         : fbinds1                       { $1 }
-        | {- empty -}                   { return ([],([], Nothing)) }
+        | {- empty -}                   { return ([], Nothing) }
 
-fbinds1 :: { forall b. DisambECP b => PV ([AddApiAnn],([LHsRecField GhcPs (LocatedA b)], Maybe SrcSpan)) }
+fbinds1 :: { forall b. DisambECP b => PV ([LHsRecField GhcPs (LocatedA b)], Maybe SrcSpan) }
         : fbind ',' fbinds1
                  { $1 >>= \ $1 ->
                    $3 >>= \ $3 -> do
                    h <- addTrailingCommaA $1 (gl $2)
-                   return (case $3 of (ma,(flds, dd)) -> (ma,(h : flds, dd))) }
+                   return (case $3 of (flds, dd) -> (h : flds, dd)) }
         | fbind                         { $1 >>= \ $1 ->
-                                          return ([],([$1], Nothing)) }
-        | '..'                          { return ([mj AnnDotdot $1],([],   Just (getLoc $1))) }
+                                          return ([$1], Nothing) }
+        | '..'                          { return ([],   Just (getLoc $1)) }
 
 fbind   :: { forall b. DisambECP b => PV (LHsRecField GhcPs (LocatedA b)) }
         : qvar '=' texp  { unECP $3 >>= \ $3 ->
@@ -4280,4 +4283,11 @@ addTrailingCommaN (L (SrcSpanAnn anns l) a) span = do
                 then anns
                 else addTrailingCommaToN l anns (rs span)
   return (L (SrcSpanAnn anns' l) a)
+
+-- -------------------------------------
+
+-- AZ: this might be a silly approach
+adaptWhereBinds :: Maybe (Located (HsLocalBinds GhcPs)) -> Located (HsLocalBinds GhcPs)
+adaptWhereBinds Nothing = noLoc (EmptyLocalBinds noExtField)
+adaptWhereBinds (Just b) = b
 }

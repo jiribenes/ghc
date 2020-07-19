@@ -109,6 +109,7 @@ module GHC.Types.SrcLoc (
         psSpanStart,
         psSpanEnd,
         mkSrcSpanPs,
+        combineRealSrcSpans
 
         -- * Layout information
         LayoutInfo(..),

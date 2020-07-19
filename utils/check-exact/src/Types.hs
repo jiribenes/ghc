@@ -45,19 +45,19 @@ emptyAnns = Map.empty
 -- | For every @Located a@, use the @SrcSpan@ and constructor name of
 -- a as the key, to store the standard annotation.
 -- These are used to maintain context in the AP and EP monads
-data AnnKey   = AnnKey SrcSpan AnnConName
+data AnnKey   = AnnKey RealSrcSpan AnnConName
                   deriving (Eq, Data, Ord)
-deriving instance Ord SrcSpan
+-- deriving instance Ord SrcSpan
 
 -- More compact Show instance
 instance Show AnnKey where
   show (AnnKey ss cn) = "AnnKey " ++ showGhc ss ++ " " ++ show cn
 
 mkAnnKeyPrim :: (Data a) => Located a -> AnnKey
-mkAnnKeyPrim (L l a) = AnnKey l (annGetConstr a)
+mkAnnKeyPrim (L l a) = AnnKey (realSrcSpan l) (annGetConstr a)
 
 mkAnnKeyPrimA :: (Data a) => LocatedA a -> AnnKey
-mkAnnKeyPrimA (L l a) = AnnKey (locA l) (annGetConstr a)
+mkAnnKeyPrimA (L l a) = AnnKey (realSrcSpan $ locA l) (annGetConstr a)
 
 -- Holds the name of a constructor
 data AnnConName = CN { unConName :: String }
@@ -111,7 +111,7 @@ data Annotation = Ann
   -- The next three fields relate to interacing down into the AST
   , annsDP             :: ![(KeywordId, DeltaPos)]
     -- ^ Annotations associated with this element.
-  , annSortKey         :: !(Maybe [SrcSpan])
+  , annSortKey         :: !(Maybe [RealSrcSpan])
     -- ^ Captures the sort order of sub elements. This is needed when the
     -- sub-elements have been split (as in a HsLocalBind which holds separate
     -- binds and sigs) or for infix patterns where the order has been

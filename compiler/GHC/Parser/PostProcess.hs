@@ -37,6 +37,7 @@ module GHC.Parser.PostProcess (
         setRdrNameSpace,
         filterCTuple,
         fromSpecTyVarBndr, fromSpecTyVarBndrs,
+        annBinds,
 
         cvBindGroup,
         cvBindsAndSigs,
@@ -436,6 +437,16 @@ fromSpecTyVarBndr bndr = case bndr of
     check_spec SpecifiedSpec _   = return ()
     check_spec InferredSpec  loc = addFatalError loc
                                    (text "Inferred type variables are not allowed here")
+
+-- | Add the annotation for a 'where' keyword to existing @HsLocalBinds@
+annBinds :: AddApiAnn -> HsLocalBinds GhcPs -> HsLocalBinds GhcPs
+annBinds a (HsValBinds an bs)  = (HsValBinds (add_where a an) bs)
+annBinds a (HsIPBinds an bs)   = (HsIPBinds (add_where a an) bs)
+annBinds _ (EmptyLocalBinds x) = (EmptyLocalBinds x)
+
+add_where :: AddApiAnn -> ApiAnn' AnnList -> ApiAnn' AnnList
+add_where an@(AddApiAnn _ rs) (ApiAnn a (AnnList o c r t) cs)
+  = (ApiAnn (combineRealSrcSpans rs a) (AnnList o c (an:r) t) cs)
 
 {- **********************************************************************
 
@@ -1119,9 +1130,9 @@ checkPat loc (L l e@(PatBuilderVar (L _ c))) args
 checkPat loc (L _ (PatBuilderApp f e)) args
   = do p <- checkLPat e
        checkPat loc f (p : args)
-checkPat loc (L _ e) []
+checkPat loc (L l e) []
   = do p <- checkAPat loc e
-       return (L (noAnnSrcSpan loc) p)
+       return (L l p)
 checkPat loc e _
   = patFail loc (ppr e)
 
@@ -1271,9 +1282,9 @@ checkPatBind loc annsIn lhs (L match_span grhss)
     | BangPat _ p <- unLoc lhs
     , VarPat _ v <- unLoc p
     = do
-        cs <- addAnnsAt loc []
-        return (makeFunBind v (L (noAnnSrcSpan match_span)
-                [L (noAnnSrcSpan match_span) (m (ApiAnn (realSrcSpan loc) annsIn cs) v)]))
+        let (L _ (BangPat (ApiAnn _ ans cs) _)) = lhs
+        return (makeFunBind v (L (noAnnSrcSpan loc)
+                [L (noAnnSrcSpan loc) (m (ApiAnn (realSrcSpan loc) (ans++annsIn) cs) v)]))
   where
     m a v = Match { m_ext = a
                   , m_ctxt = FunRhs { mc_fun    = v
@@ -1468,7 +1479,7 @@ class b ~ (Body b) GhcPs => DisambECP b where
     :: SrcSpan -> (ApiAnnComments -> MatchGroup GhcPs (LocatedA b)) -> PV (LocatedA b)
   -- | Disambiguate "let ... in ..."
   mkHsLetPV
-    :: SrcSpan -> LHsLocalBinds GhcPs -> LocatedA b -> [AddApiAnn] -> PV (LocatedA b)
+    :: SrcSpan -> HsLocalBinds GhcPs -> LocatedA b -> [AddApiAnn] -> PV (LocatedA b)
   -- | Infix operator representation
   type InfixOp b
   -- | Bring superclass constraints on InfixOp into scope.
@@ -1865,10 +1876,10 @@ instance DisambECP (PatBuilder GhcPs) where
     p <- checkLPat (reLocA e)
     cs <- addAnnsAt l []
     return $ L (noAnnSrcSpan l) (PatBuilderPat (LazyPat (ApiAnn (realSrcSpan l) a cs) p))
-  mkHsBangPatPV l e a = do
+  mkHsBangPatPV l e an = do
     p <- checkLPat (reLocA e)
     cs <- addAnnsAt l []
-    let pb = BangPat (ApiAnn (realSrcSpan l) a cs) p
+    let pb = BangPat (ApiAnn (realSrcSpan l) an cs) p
     hintBangPat l pb
     return $ L (noAnnSrcSpan l) (PatBuilderPat pb)
   mkSumOrTuplePV = mkSumOrTuplePat

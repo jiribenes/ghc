@@ -79,11 +79,10 @@ import Control.Monad
 ************************************************************************
 -}
 
-dsLocalBinds :: LHsLocalBinds GhcTc -> CoreExpr -> DsM CoreExpr
-dsLocalBinds (L _   (EmptyLocalBinds _))  body = return body
-dsLocalBinds (L loc (HsValBinds _ binds)) body = putSrcSpanDsA loc $
-                                                 dsValBinds binds body
-dsLocalBinds (L _ (HsIPBinds _ binds))    body = dsIPBinds  binds body
+dsLocalBinds :: HsLocalBinds GhcTc -> CoreExpr -> DsM CoreExpr
+dsLocalBinds (EmptyLocalBinds _)  body = return body
+dsLocalBinds (HsValBinds _ binds) body = dsValBinds binds body
+dsLocalBinds (HsIPBinds _ binds)  body = dsIPBinds  binds body
 
 -------------------------
 -- caller sets location
@@ -485,7 +484,7 @@ dsExpr (HsMultiIf res_ty alts)
   = mkErrorExpr
 
   | otherwise
-  = do { let grhss = GRHSs noAnn alts (noLocA emptyLocalBinds)
+  = do { let grhss = GRHSs noAnn alts emptyLocalBinds
        ; rhss_deltas  <- checkGRHSs IfAlt grhss
        ; match_result <- dsGRHSs IfAlt grhss res_ty rhss_deltas
        ; error_expr   <- mkErrorExpr

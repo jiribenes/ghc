@@ -621,7 +621,7 @@ data AnnListItem
 -- Managing annotations for lists
 -- ---------------------------------------------------------------------
 
--- AZ:TODO: consider adding a AnnSortKey
+-- AZ:TODO: consider adding an AnnSortKey
 data AnnList
   = AnnList {
       al_open      :: Maybe AddApiAnn,
