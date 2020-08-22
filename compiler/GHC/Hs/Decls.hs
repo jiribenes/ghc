@@ -1450,7 +1450,7 @@ data ConDecl pass
                        -- Whether or not there is an /explicit/ forall, we still
                        -- need to capture the implicitly-bound type/kind variables
       -}
-      , con_bndrs   :: Located (HsOuterGadtTyVarBndrs pass) -- ^ TODO RGS: Docs
+      , con_bndrs   :: Located (HsOuterSigTyVarBndrs pass) -- ^ TODO RGS: Docs
 
       , con_mb_cxt  :: Maybe (LHsContext pass) -- ^ User-written context (if any)
       , con_args    :: HsConDeclDetails pass   -- ^ Arguments; never InfixCon
@@ -1702,7 +1702,7 @@ pprConDecl (ConDeclGADT { con_names = cons, con_bndrs = L _ outer_bndrs
                         , con_mb_cxt = mcxt, con_args = args
                         , con_res_ty = res_ty, con_doc = doc })
   = ppr_mbDoc doc <+> ppr_con_names cons <+> dcolon
-    <+> (sep [pprHsOuterGadtTyVarBndrs outer_bndrs <+> pprLHsContext cxt,
+    <+> (sep [pprHsOuterSigTyVarBndrs outer_bndrs <+> pprLHsContext cxt,
               ppr_arrow_chain (get_args args ++ [ppr res_ty]) ])
   where
     get_args (PrefixCon args) = map ppr args
@@ -1873,7 +1873,7 @@ type LClsInstDecl pass = XRec pass (ClsInstDecl pass)
 data ClsInstDecl pass
   = ClsInstDecl
       { cid_ext     :: XCClsInstDecl pass
-      , cid_poly_ty :: LHsSigType pass    -- Context => Class Instance-type
+      , cid_poly_ty :: LHsSigType' pass   -- Context => Class Instance-type
                                           -- Using a polytype means that the renamer conveniently
                                           -- figures out the quantified type variables for us.
       , cid_binds         :: LHsBinds pass       -- Class methods
@@ -2062,7 +2062,7 @@ type LDerivDecl pass = XRec pass (DerivDecl pass)
 -- | Stand-alone 'deriving instance' declaration
 data DerivDecl pass = DerivDecl
         { deriv_ext          :: XCDerivDecl pass
-        , deriv_type         :: LHsSigWcType pass
+        , deriv_type         :: LHsSigWcType' pass
           -- ^ The instance type to derive.
           --
           -- It uses an 'LHsSigWcType' because the context is allowed to be a
@@ -2123,8 +2123,8 @@ data DerivStrategy pass
   | ViaStrategy (XViaStrategy pass)
                      -- ^ @-XDerivingVia@
 
-type instance XViaStrategy GhcPs = LHsSigType GhcPs
-type instance XViaStrategy GhcRn = LHsSigType GhcRn
+type instance XViaStrategy GhcPs = LHsSigType' GhcPs
+type instance XViaStrategy GhcRn = LHsSigType' GhcRn
 type instance XViaStrategy GhcTc = Type
 
 instance OutputableBndrId p

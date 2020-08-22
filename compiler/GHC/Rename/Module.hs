@@ -35,7 +35,7 @@ import GHC.Rename.Utils ( HsDocContext(..), mapFvRn, bindLocalNames
                         , checkShadowedRdrNames, warnUnusedTypePatterns
                         , extendTyVarEnvFVRn, newLocalBndrsRn
                         , withHsDocContext, noNestedForallsContextsErr
-                        , addNoNestedForallsContextsErr, checkInferredVars )
+                        , addNoNestedForallsContextsErr, checkInferredVars, checkInferredVars' )
 import GHC.Rename.Unbound ( mkUnboundName, notInScopeErr )
 import GHC.Rename.Names
 import GHC.Rename.Doc   ( rnHsDoc, rnMbLHsDoc )
@@ -450,7 +450,7 @@ rnSrcInstDecl (ClsInstD { cid_inst = cid })
 --
 -- See also descriptions of 'checkCanonicalMonadInstances' and
 -- 'checkCanonicalMonoidInstances'
-checkCanonicalInstances :: Name -> LHsSigType GhcRn -> LHsBinds GhcRn -> RnM ()
+checkCanonicalInstances :: Name -> LHsSigType' GhcRn -> LHsBinds GhcRn -> RnM ()
 checkCanonicalInstances cls poly_ty mbinds = do
     whenWOptM Opt_WarnNonCanonicalMonadInstances
         checkCanonicalMonadInstances
@@ -589,9 +589,9 @@ checkCanonicalInstances cls poly_ty mbinds = do
                        ]
 
     -- stolen from GHC.Tc.TyCl.Instance
-    instDeclCtxt1 :: LHsSigType GhcRn -> SDoc
+    instDeclCtxt1 :: LHsSigType' GhcRn -> SDoc
     instDeclCtxt1 hs_inst_ty
-      = inst_decl_ctxt (ppr (getLHsInstDeclHead hs_inst_ty))
+      = inst_decl_ctxt (ppr (getLHsInstDeclHead' hs_inst_ty))
 
     inst_decl_ctxt :: SDoc -> SDoc
     inst_decl_ctxt doc = hang (text "in the instance declaration for")
@@ -603,9 +603,9 @@ rnClsInstDecl (ClsInstDecl { cid_poly_ty = inst_ty, cid_binds = mbinds
                            , cid_sigs = uprags, cid_tyfam_insts = ats
                            , cid_overlap_mode = oflag
                            , cid_datafam_insts = adts })
-  = do { checkInferredVars ctxt inf_err inst_ty
-       ; (inst_ty', inst_fvs) <- rnHsSigType ctxt TypeLevel inst_ty
-       ; let (ktv_names, _, head_ty') = splitLHsInstDeclTy inst_ty'
+  = do { checkInferredVars' ctxt inf_err inst_ty
+       ; (inst_ty', inst_fvs) <- rnLHsSigType ctxt TypeLevel inst_ty
+       ; let (ktv_names, _, head_ty') = splitLHsInstDeclTy' inst_ty'
              -- Check if there are any nested `forall`s or contexts, which are
              -- illegal in the type of an instance declaration (see
              -- Note [No nested foralls or contexts in instance types] in
@@ -724,15 +724,7 @@ rnFamEqn doc atfi rhs_kvars
          -- @
        ; let all_imp_vars = pat_kity_vars_with_dups ++ rhs_kvars
 
-       {-
-       TODO RGS: Delete
-
-       ; rnImplicitBndrs mb_cls all_imp_vars $ \all_imp_var_names' ->
-         bindLHsTyVarBndrs doc WarnUnusedForalls
-                           Nothing (fromMaybe [] mb_bndrs) $ \bndrs' ->
-       -}
-       ; bindHsOuterFamEqnTyVarBndrs doc mb_cls all_imp_vars
-                                     outer_bndrs $ \rn_outer_bndrs ->
+       ; bindHsOuterTyVarBndrs doc mb_cls all_imp_vars outer_bndrs $ \rn_outer_bndrs ->
     do { (pats', pat_fvs) <- rnLHsTypeArgs (FamPatCtx tycon) pats
        ; (payload', rhs_fvs) <- rn_payload doc payload
 
@@ -1075,22 +1067,22 @@ rnSrcDerivDecl :: DerivDecl GhcPs -> RnM (DerivDecl GhcRn, FreeVars)
 rnSrcDerivDecl (DerivDecl _ ty mds overlap)
   = do { standalone_deriv_ok <- xoptM LangExt.StandaloneDeriving
        ; unless standalone_deriv_ok (addErr standaloneDerivErr)
-       ; checkInferredVars ctxt inf_err nowc_ty
-       ; (mds', ty', fvs) <- rnLDerivStrategy ctxt mds $ rnHsSigWcType ctxt ty
+       ; checkInferredVars' ctxt inf_err nowc_ty
+       ; (mds', ty', fvs) <- rnLDerivStrategy ctxt mds $ rnLHsSigWcType ctxt ty
          -- Check if there are any nested `forall`s or contexts, which are
          -- illegal in the type of an instance declaration (see
          -- Note [No nested foralls or contexts in instance types] in
          -- GHC.Hs.Type).
        ; addNoNestedForallsContextsErr ctxt
            (text "Standalone-derived instance head")
-           (getLHsInstDeclHead $ dropWildCards ty')
+           (getLHsInstDeclHead' $ dropWildCards' ty')
        ; warnNoDerivStrat mds' loc
        ; return (DerivDecl noExtField ty' mds' overlap, fvs) }
   where
     ctxt    = DerivDeclCtx
     inf_err = Just (text "Inferred type variables are not allowed")
-    loc = getLoc $ hsib_body nowc_ty
-    nowc_ty = dropWildCards ty
+    loc = getLoc nowc_ty
+    nowc_ty = dropWildCards' ty
 
 standaloneDerivErr :: SDoc
 standaloneDerivErr
@@ -1946,19 +1938,22 @@ rnLDerivStrategy doc mds thing_inside
         AnyclassStrategy -> boring_case AnyclassStrategy
         NewtypeStrategy  -> boring_case NewtypeStrategy
         ViaStrategy via_ty ->
-          do checkInferredVars doc inf_err via_ty
-             (via_ty', fvs1) <- rnHsSigType doc TypeLevel via_ty
-             let HsIB { hsib_ext  = via_imp_tvs
-                      , hsib_body = via_body } = via_ty'
-                 (via_exp_tv_bndrs, via_rho) = splitLHsForAllTyInvis_KP via_body
-                 via_exp_tvs = maybe [] hsLTyVarNames via_exp_tv_bndrs
-                 via_tvs = via_imp_tvs ++ via_exp_tvs
+          do checkInferredVars' doc inf_err via_ty
+             (via_ty', fvs1) <- rnLHsSigType doc TypeLevel via_ty
+             let HsSig { sig_bndrs = via_outer_bndrs
+                       , sig_body  = via_body } = unLoc via_ty'
+                 -- TODO RGS: We also do something like this in splitLHsInstDeclTy.
+                 -- Consider factoring this out into its own function in the same
+                 -- vein as hsScopedTvs.
+                 via_tvs = case via_outer_bndrs of
+                             HsOuterImplicit{hso_ximplicit = imp_tvs} -> imp_tvs
+                             HsOuterExplicit{hso_bndrs = exp_bndrs} -> hsLTyVarNames exp_bndrs
              -- Check if there are any nested `forall`s, which are illegal in a
              -- `via` type.
              -- See Note [No nested foralls or contexts in instance types]
              -- (Wrinkle: Derived instances) in GHC.Hs.Type.
              addNoNestedForallsContextsErr doc
-               (quotes (text "via") <+> text "type") via_rho
+               (quotes (text "via") <+> text "type") via_body
              (thing, fvs2) <- extendTyVarEnvFVRn via_tvs thing_inside
              pure (ViaStrategy via_ty', thing, fvs1 `plusFV` fvs2)
 
@@ -2231,12 +2226,12 @@ rnConDecl (ConDeclGADT { con_names   = names
               -- variable, and hence the order needed for visible type application
               -- See #14808.
               implicit_bndrs =
-                extractHsOuterGadtTvBndrs outer_bndrs $
+                extractHsOuterTvBndrs outer_bndrs $
                 extractHsTysRdrTyVars (theta ++ map hsScaledThing arg_tys ++ [res_ty])
 
         ; let ctxt = ConDeclCtx new_names
 
-        ; bindHsOuterGadtTyVarBndrs ctxt implicit_bndrs outer_bndrs $ \outer_bndrs' ->
+        ; bindHsOuterTyVarBndrs ctxt Nothing implicit_bndrs outer_bndrs $ \outer_bndrs' ->
     do  { (new_cxt, fvs1)    <- rnMbContext ctxt mcxt
         ; (new_args, fvs2)   <- rnConDeclDetails (unLoc (head new_names)) ctxt args
         ; (new_res_ty, fvs3) <- rnLHsType ctxt res_ty

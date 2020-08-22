@@ -800,7 +800,7 @@ getLocalNonValBinders fixity_env
            -- be Nothing.
            mb_cls_nm <- runMaybeT $ do
              -- See (1) above
-             L loc cls_rdr <- MaybeT $ pure $ getLHsInstDeclClass_maybe inst_ty
+             L loc cls_rdr <- MaybeT $ pure $ getLHsInstDeclClass_maybe' inst_ty
              -- See (2) above
              MaybeT $ setSrcSpan loc $ lookupGlobalOccRn_maybe cls_rdr
            -- Assuming the previous step succeeded, process any associated data

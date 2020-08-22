@@ -286,9 +286,10 @@ cvtDec (InstanceD o ctxt ty decs)
         ; unless (null fams') (failWith (mkBadDecMsg doc fams'))
         ; ctxt' <- cvtContext funPrec ctxt
         ; (L loc ty') <- cvtType ty
-        ; let inst_ty' = mkHsQualTy ctxt loc ctxt' $ L loc ty'
+        ; let inst_ty' = hsTypeToHsSigType $
+                         mkHsQualTy ctxt loc ctxt' $ L loc ty'
         ; returnJustL $ InstD noExtField $ ClsInstD noExtField $
-          ClsInstDecl { cid_ext = noExtField, cid_poly_ty = mkLHsSigType inst_ty'
+          ClsInstDecl { cid_ext = noExtField, cid_poly_ty = inst_ty'
                       , cid_binds = binds'
                       , cid_sigs = Hs.mkClassOpSigs sigs'
                       , cid_tyfam_insts = ats', cid_datafam_insts = adts'
@@ -383,18 +384,19 @@ cvtDec (TH.StandaloneDerivD ds cxt ty)
   = do { cxt' <- cvtContext funPrec cxt
        ; ds'  <- traverse cvtDerivStrategy ds
        ; (L loc ty') <- cvtType ty
-       ; let inst_ty' = mkHsQualTy cxt loc cxt' $ L loc ty'
+       ; let inst_ty' = hsTypeToHsSigType $
+                        mkHsQualTy cxt loc cxt' $ L loc ty'
        ; returnJustL $ DerivD noExtField $
          DerivDecl { deriv_ext =noExtField
                    , deriv_strategy = ds'
-                   , deriv_type = mkLHsSigWcType inst_ty'
+                   , deriv_type = mkHsWildCardBndrs inst_ty'
                    , deriv_overlap_mode = Nothing } }
 
 cvtDec (TH.DefaultSigD nm typ)
   = do { nm' <- vNameL nm
-       ; ty' <- cvtType typ
+       ; ty' <- cvtSigType typ
        ; returnJustL $ Hs.SigD noExtField
-                     $ ClassOpSig noExtField True [nm'] (mkLHsSigType ty')}
+                     $ ClassOpSig noExtField True [nm'] ty'}
 
 cvtDec (TH.PatSynD nm args dir pat)
   = do { nm'   <- cNameL nm
@@ -421,7 +423,7 @@ cvtDec (TH.PatSynD nm args dir pat)
 cvtDec (TH.PatSynSigD nm ty)
   = do { nm' <- cNameL nm
        ; ty' <- cvtPatSynSigTy ty
-       ; returnJustL $ Hs.SigD noExtField $ PatSynSig noExtField [nm'] (mkLHsSigType ty')}
+       ; returnJustL $ Hs.SigD noExtField $ PatSynSig noExtField [nm'] ty'}
 
 -- Implicit parameter bindings are handled in cvtLocalDecs and
 -- cvtImplicitParamBind. They are not allowed in any other scope, so
@@ -1413,8 +1415,8 @@ cvtDerivStrategy TH.StockStrategy    = returnL Hs.StockStrategy
 cvtDerivStrategy TH.AnyclassStrategy = returnL Hs.AnyclassStrategy
 cvtDerivStrategy TH.NewtypeStrategy  = returnL Hs.NewtypeStrategy
 cvtDerivStrategy (TH.ViaStrategy ty) = do
-  ty' <- cvtType ty
-  returnL $ Hs.ViaStrategy (mkLHsSigType ty')
+  ty' <- cvtSigType ty
+  returnL $ Hs.ViaStrategy ty'
 
 cvtType :: TH.Type -> CvtM (LHsType GhcPs)
 cvtType = cvtTypeKind "type"
@@ -1426,10 +1428,7 @@ cvtSigType = cvtSigTypeKind "type"
 cvtSigTypeKind :: String -> TH.Type -> CvtM (LHsSigType' GhcPs)
 cvtSigTypeKind ty_str ty = do
   ty' <- cvtTypeKind ty_str ty
-  pure $ case ty' of
-    L loc (HsForAllTy { hst_tele = tele, hst_body = body })
-            -> L loc $ mkHsExplicitSigType tele body
-    L loc _ -> L loc $ mkHsImplicitSigType ty'
+  pure $ hsTypeToHsSigType ty'
 
 cvtTypeKind :: String -> TH.Type -> CvtM (LHsType GhcPs)
 cvtTypeKind ty_str ty
@@ -1760,30 +1759,28 @@ cvtInjectivityAnnotation (TH.InjectivityAnn annLHS annRHS)
        ; annRHS' <- mapM tNameL annRHS
        ; returnL (Hs.InjectivityAnn annLHS' annRHS') }
 
-cvtPatSynSigTy :: TH.Type -> CvtM (LHsType GhcPs)
+cvtPatSynSigTy :: TH.Type -> CvtM (LHsSigType' GhcPs)
 -- pattern synonym types are of peculiar shapes, which is why we treat
 -- them separately from regular types;
 -- see Note [Pattern synonym type signatures and Template Haskell]
 cvtPatSynSigTy (ForallT univs reqs (ForallT exis provs ty))
-  | null exis, null provs = cvtType (ForallT univs reqs ty)
+  | null exis, null provs = cvtSigType (ForallT univs reqs ty)
   | null univs, null reqs = do { l   <- getL
                                ; ty' <- cvtType (ForallT exis provs ty)
-                               ; return $ L l (HsQualTy { hst_ctxt = L l []
+                               ; return $ L l $ mkHsImplicitSigType
+                                        $ L l (HsQualTy { hst_ctxt = L l []
                                                         , hst_xqual = noExtField
                                                         , hst_body = ty' }) }
   | null reqs             = do { l      <- getL
                                ; univs' <- cvtTvs univs
                                ; ty'    <- cvtType (ForallT exis provs ty)
-                               ; let forTy = HsForAllTy
-                                              { hst_tele = mkHsForAllInvisTele univs'
-                                              , hst_xforall = noExtField
-                                              , hst_body = L l cxtTy }
+                               ; let forTy = mkHsExplicitSigType univs' $ L l cxtTy
                                      cxtTy = HsQualTy { hst_ctxt = L l []
                                                       , hst_xqual = noExtField
                                                       , hst_body = ty' }
                                ; return $ L l forTy }
-  | otherwise             = cvtType (ForallT univs reqs (ForallT exis provs ty))
-cvtPatSynSigTy ty         = cvtType ty
+  | otherwise             = cvtSigType (ForallT univs reqs (ForallT exis provs ty))
+cvtPatSynSigTy ty         = cvtSigType ty
 
 -----------------------------------------------------------
 cvtFixity :: TH.Fixity -> Hs.Fixity

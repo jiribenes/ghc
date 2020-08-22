@@ -1158,7 +1158,7 @@ sks_vars :: { Located [Located RdrName] }  -- Returned in reverse order
   | oqtycon { sL1 $1 [$1] }
 
 inst_decl :: { LInstDecl GhcPs }
-        : 'instance' overlap_pragma inst_type where_inst
+        : 'instance' overlap_pragma inst_type2 where_inst
        {% do { (binds, sigs, _, ats, adts, _) <- cvBindsAndSigs (snd $ unLoc $4)
              ; let cid = ClsInstDecl { cid_ext = noExtField
                                      , cid_poly_ty = $3, cid_binds = binds
@@ -1166,7 +1166,7 @@ inst_decl :: { LInstDecl GhcPs }
                                      , cid_tyfam_insts = ats
                                      , cid_overlap_mode = $2
                                      , cid_datafam_insts = adts }
-             ; ams (L (comb3 $1 (hsSigType $3) $4) (ClsInstD { cid_d_ext = noExtField, cid_inst = cid }))
+             ; ams (L (comb3 $1 $3 $4) (ClsInstD { cid_d_ext = noExtField, cid_inst = cid }))
                    (mj AnnInstance $1 : (fst $ unLoc $4)) } }
 
            -- type instance declarations
@@ -1213,7 +1213,7 @@ deriv_strategy_no_via :: { LDerivStrategy GhcPs }
                                        [mj AnnNewtype $1] }
 
 deriv_strategy_via :: { LDerivStrategy GhcPs }
-  : 'via' ktype             {% ams (sLL $1 $> (ViaStrategy (mkLHsSigType $2)))
+  : 'via' sigktype2         {% ams (sLL $1 $> (ViaStrategy $2))
                                        [mj AnnVia $1] }
 
 deriv_standalone_strategy :: { Maybe (LDerivStrategy GhcPs) }
@@ -1441,10 +1441,10 @@ capi_ctype : '{-# CTYPE' STRING STRING '#-}'
 
 -- Glasgow extension: stand-alone deriving declarations
 stand_alone_deriving :: { LDerivDecl GhcPs }
-  : 'deriving' deriv_standalone_strategy 'instance' overlap_pragma inst_type
+  : 'deriving' deriv_standalone_strategy 'instance' overlap_pragma inst_type2
                 {% do { let { err = text "in the stand-alone deriving instance"
                                     <> colon <+> quotes (ppr $5) }
-                      ; ams (sLL $1 (hsSigType $>)
+                      ; ams (sLL $1 $>
                                  (DerivDecl noExtField (mkHsWildCardBndrs $5) $2 $4))
                             [mj AnnDeriving $1, mj AnnInstance $3] } }
 
@@ -1516,8 +1516,8 @@ where_decls :: { Located ([AddAnn]
                                           ,sL1 $3 (snd $ unLoc $3)) }
 
 pattern_synonym_sig :: { LSig GhcPs }
-        : 'pattern' con_list '::' sigtype
-                   {% ams (sLL $1 $> $ PatSynSig noExtField (unLoc $2) (mkLHsSigType $4))
+        : 'pattern' con_list '::' sigtype2
+                   {% ams (sLL $1 $> $ PatSynSig noExtField (unLoc $2) $4)
                           [mj AnnPattern $1, mu AnnDcolon $3] }
 
 -----------------------------------------------------------------------------
@@ -1530,12 +1530,12 @@ decl_cls  : at_decl_cls                 { $1 }
           | decl                        { $1 }
 
           -- A 'default' signature used with the generic-programming extension
-          | 'default' infixexp '::' sigtype
+          | 'default' infixexp '::' sigtype2
                     {% runPV (unECP $2) >>= \ $2 ->
                        do { v <- checkValSigLhs $2
                           ; let err = text "in default signature" <> colon <+>
                                       quotes (ppr $2)
-                          ; ams (sLL $1 $> $ SigD noExtField $ ClassOpSig noExtField True [v] $ mkLHsSigType $4)
+                          ; ams (sLL $1 $> $ SigD noExtField $ ClassOpSig noExtField True [v] $4)
                                 [mj AnnDefault $1,mu AnnDcolon $3] } }
 
 decls_cls :: { Located ([AddAnn],OrdList (LHsDecl GhcPs)) }  -- Reversed
@@ -1885,21 +1885,8 @@ sigktype2 :: { LHsSigType' GhcPs }
 -- TODO RGS: Docs
 -- TODO RGS: This is the REAL sigtype production. Delete the one above (and rename this) when ready
 sigtype2 :: { LHsSigType' GhcPs }
-        : forall_telescope ctype      {% let (forall_tok, forall_anns, forall_tele) = unLoc $1 in
-                                         hintExplicitForall LangExt.ScopedTypeVariables forall_tok
-                                         >> ams (sLL $1 $> $
-                                                 mkHsExplicitSigType forall_tele $2)
-                                                forall_anns }
-        | context '=>' ctype          {% do { addAnnotation (gl $1) (toUnicodeAnn AnnDarrow $2) (gl $2)
-                                            ; return $
-                                                sLL $1 $> $ mkHsImplicitSigType $
-                                                sLL $1 $> $ HsQualTy { hst_ctxt = $1
-                                                                     , hst_xqual = noExtField
-                                                                     , hst_body = $3 }}}
-        | ipvar '::' type             {% ams (sLL $1 $> $ mkHsImplicitSigType $
-                                              sLL $1 $> $ HsIParamTy noExtField $1 $3)
-                                             [mu AnnDcolon $2] }
-        | type                        { sL1 $1 $ mkHsImplicitSigType $1 }
+        : ctype_w_ext                      {% do { ty <- $1 LangExt.ScopedTypeVariables
+                                                 ; pure (hsTypeToHsSigType ty) }}
 
 sig_vars :: { Located [Located RdrName] }    -- Returned in reversed order
          : sig_vars ',' var           {% addAnnotation (gl $ head $ unLoc $1)
@@ -1926,40 +1913,51 @@ unpackedness :: { Located UnpackednessPragma }
         : '{-# UNPACK' '#-}'   { sLL $1 $> (UnpackednessPragma [mo $1, mc $2] (getUNPACK_PRAGs $1) SrcUnpack) }
         | '{-# NOUNPACK' '#-}' { sLL $1 $> (UnpackednessPragma [mo $1, mc $2] (getNOUNPACK_PRAGs $1) SrcNoUnpack) }
 
-forall_telescope :: { Located (Located Token, [AddAnn], HsForAllTelescope GhcPs) }
-        : 'forall' tv_bndrs '.'  { sLL $1 $>
-                                     ( $1
-                                     , [mu AnnForall $1, mu AnnDot $3]
-                                     , mkHsForAllInvisTele $2 ) }
-        | 'forall' tv_bndrs '->' {% do { req_tvbs <- fromSpecTyVarBndrs $2
-                                       ; pure $ sLL $1 $> $
-                                           ( $1
-                                           , [mu AnnForall $1, mu AnnRarrow $3]
-                                           , mkHsForAllVisTele req_tvbs ) }}
+-- TODO RGS: Explain the Extension argument
+forall_telescope :: { LangExt.Extension -> P (Located ([AddAnn], HsForAllTelescope GhcPs)) }
+        : 'forall' tv_bndrs '.'  { \ext ->
+                                   do { hintExplicitForall ext $1
+                                      ; pure $ sLL $1 $>
+                                          ( [mu AnnForall $1, mu AnnDot $3]
+                                          , mkHsForAllInvisTele $2 ) }}
+        | 'forall' tv_bndrs '->' { \_ ->
+                                   do { hintExplicitForall LangExt.RankNTypes $1
+                                      ; req_tvbs <- fromSpecTyVarBndrs $2
+                                      ; pure $ sLL $1 $> $
+                                          ( [mu AnnForall $1, mu AnnRarrow $3]
+                                          , mkHsForAllVisTele req_tvbs ) }}
 
 -- A ktype is a ctype, possibly with a kind annotation
 ktype :: { LHsType GhcPs }
         : ctype                { $1 }
         | ctype '::' kind      {% ams (sLL $1 $> $ HsKindSig noExtField $1 $3)
                                       [mu AnnDcolon $2] }
+-- A ctype is a for-all type
+-- TODO RGS: More docs
+ctype :: { LHsType GhcPs }
+        : ctype_w_ext          {% $1 LangExt.RankNTypes }
 
 -- A ctype is a for-all type
-ctype   :: { LHsType GhcPs }
-        : forall_telescope ctype      {% let (forall_tok, forall_anns, forall_tele) = unLoc $1 in
-                                         hintExplicitForall LangExt.RankNTypes forall_tok
-                                         >> ams (sLL $1 $> $
-                                                 HsForAllTy { hst_tele = forall_tele
-                                                            , hst_xforall = noExtField
-                                                            , hst_body = $2 })
-                                                forall_anns }
-        | context '=>' ctype          {% addAnnotation (gl $1) (toUnicodeAnn AnnDarrow $2) (gl $2)
-                                         >> return (sLL $1 $> $
-                                            HsQualTy { hst_ctxt = $1
-                                                     , hst_xqual = noExtField
-                                                     , hst_body = $3 }) }
-        | ipvar '::' type             {% ams (sLL $1 $> (HsIParamTy noExtField $1 $3))
-                                             [mu AnnDcolon $2] }
-        | type                        { $1 }
+-- TODO RGS: Explain the Extension argument. Revise the docs.
+ctype_w_ext :: { LangExt.Extension -> P (LHsType GhcPs) }
+        : forall_telescope ctype      { \ext ->
+                                        do { ltele <- $1 ext
+                                           ; let (forall_anns, forall_tele) = unLoc ltele
+                                           ; ams (sLL ltele $> $
+                                                  HsForAllTy { hst_tele = forall_tele
+                                                             , hst_xforall = noExtField
+                                                             , hst_body = $2 })
+                                                 forall_anns }}
+        | context '=>' ctype          { \_ ->
+                                        addAnnotation (gl $1) (toUnicodeAnn AnnDarrow $2) (gl $2)
+                                        >> return (sLL $1 $> $
+                                           HsQualTy { hst_ctxt = $1
+                                                    , hst_xqual = noExtField
+                                                    , hst_body = $3 }) }
+        | ipvar '::' type             { \_ ->
+                                        ams (sLL $1 $> (HsIParamTy noExtField $1 $3))
+                                            [mu AnnDcolon $2] }
+        | type                        { \_ -> pure $1 }
 
 ----------------------
 -- Notes for 'context'

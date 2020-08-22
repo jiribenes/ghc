@@ -480,7 +480,7 @@ tcClsInstDecl (L loc (ClsInstDecl { cid_poly_ty = hs_ty, cid_binds = binds
                                   , cid_datafam_insts = adts }))
   = setSrcSpan loc                      $
     addErrCtxt (instDeclCtxt1 hs_ty)  $
-    do  { dfun_ty <- tcHsClsInstType (InstDeclCtxt False) hs_ty
+    do  { dfun_ty <- tcHsClsInstType' (InstDeclCtxt False) hs_ty
         ; let (tyvars, theta, clas, inst_tys) = tcSplitDFunTy dfun_ty
              -- NB: tcHsClsInstType does checkValidInstance
 
@@ -517,7 +517,7 @@ tcClsInstDecl (L loc (ClsInstDecl { cid_poly_ty = hs_ty, cid_binds = binds
 
         -- Finally, construct the Core representation of the instance.
         -- (This no longer includes the associated types.)
-        ; dfun_name <- newDFunName clas inst_tys (getLoc (hsSigType hs_ty))
+        ; dfun_name <- newDFunName clas inst_tys (getLoc hs_ty)
                 -- Dfun location is that of instance *header*
 
         ; ispec <- newClsInst (fmap unLoc overlap_mode) dfun_name
@@ -1783,10 +1783,10 @@ tcMethodBodyHelp hs_sig_fn sel_id local_meth_id meth_bind
               -- There is a signature in the instance
               -- See Note [Instance method signatures]
   = do { (sig_ty, hs_wrap)
-             <- setSrcSpan (getLoc (hsSigType hs_sig_ty)) $
+             <- setSrcSpan (getLoc hs_sig_ty) $
                 do { inst_sigs <- xoptM LangExt.InstanceSigs
                    ; checkTc inst_sigs (misplacedInstSig sel_name hs_sig_ty)
-                   ; sig_ty  <- tcHsSigType (FunSigCtxt sel_name False) hs_sig_ty
+                   ; sig_ty  <- tcLHsSigType (FunSigCtxt sel_name False) hs_sig_ty
                    ; let local_meth_ty = idType local_meth_id
                          ctxt = FunSigCtxt sel_name False
                                 -- False <=> do not report redundant constraints when
@@ -1804,7 +1804,7 @@ tcMethodBodyHelp hs_sig_fn sel_id local_meth_id meth_bind
              inner_meth_id  = mkLocalId inner_meth_name Many sig_ty
              inner_meth_sig = CompleteSig { sig_bndr = inner_meth_id
                                           , sig_ctxt = ctxt
-                                          , sig_loc  = getLoc (hsSigType hs_sig_ty) }
+                                          , sig_loc  = getLoc hs_sig_ty }
 
 
        ; (tc_bind, [inner_id]) <- tcPolyCheck no_prag_fn inner_meth_sig meth_bind
@@ -1873,7 +1873,7 @@ methSigCtxt sel_name sig_ty meth_ty env0
                               , text "   Class sig:" <+> ppr meth_ty ])
        ; return (env2, msg) }
 
-misplacedInstSig :: Name -> LHsSigType GhcRn -> SDoc
+misplacedInstSig :: Name -> LHsSigType' GhcRn -> SDoc
 misplacedInstSig name hs_ty
   = vcat [ hang (text "Illegal type signature in instance declaration:")
               2 (hang (pprPrefixName name)
@@ -2206,9 +2206,9 @@ tcSpecInst _  _ = panic "tcSpecInst"
 ************************************************************************
 -}
 
-instDeclCtxt1 :: LHsSigType GhcRn -> SDoc
+instDeclCtxt1 :: LHsSigType' GhcRn -> SDoc
 instDeclCtxt1 hs_inst_ty
-  = inst_decl_ctxt (ppr (getLHsInstDeclHead hs_inst_ty))
+  = inst_decl_ctxt (ppr (getLHsInstDeclHead' hs_inst_ty))
 
 instDeclCtxt2 :: Type -> SDoc
 instDeclCtxt2 dfun_ty

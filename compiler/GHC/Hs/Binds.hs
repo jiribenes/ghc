@@ -894,7 +894,7 @@ data Sig pass
     TypeSig
        (XTypeSig pass)
        [XRec pass (IdP pass)]  -- LHS of the signature; e.g.  f,g,h :: blah
-       (LHsSigWcType pass)   -- RHS of the signature; can have wildcards
+       (LHsSigWcType pass)     -- RHS of the signature; can have wildcards
 
       -- | A pattern synonym type signature
       --
@@ -905,7 +905,7 @@ data Sig pass
       --           'GHC.Parser.Annotation.AnnDot','GHC.Parser.Annotation.AnnDarrow'
 
       -- For details on above see note [Api annotations] in GHC.Parser.Annotation
-  | PatSynSig (XPatSynSig pass) [XRec pass (IdP pass)] (LHsSigType pass)
+  | PatSynSig (XPatSynSig pass) [XRec pass (IdP pass)] (LHsSigType' pass)
       -- P :: forall a b. Req => Prov => ty
 
       -- | A signature for a class method
@@ -918,7 +918,7 @@ data Sig pass
       --
       --  - 'GHC.Parser.Annotation.AnnKeywordId' : 'GHC.Parser.Annotation.AnnDefault',
       --           'GHC.Parser.Annotation.AnnDcolon'
-  | ClassOpSig (XClassOpSig pass) Bool [XRec pass (IdP pass)] (LHsSigType pass)
+  | ClassOpSig (XClassOpSig pass) Bool [XRec pass (IdP pass)] (LHsSigType' pass)
 
         -- | A type signature in generated code, notably the code
         -- generated for record selectors.  We simply record

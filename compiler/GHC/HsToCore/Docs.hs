@@ -141,7 +141,7 @@ sigNameNoLoc _                             = []
 -- instanceMap.
 getInstLoc :: InstDecl (GhcPass p) -> SrcSpan
 getInstLoc = \case
-  ClsInstD _ (ClsInstDecl { cid_poly_ty = ty }) -> getLoc (hsSigType ty)
+  ClsInstD _ (ClsInstDecl { cid_poly_ty = ty }) -> getLoc ty
   -- The Names of data and type family instances have their SrcSpan's attached
   -- to the *type constructor*. For example, the Name "D:R:Foo:Int" would have
   -- its SrcSpan attached here:
@@ -246,8 +246,8 @@ classDecls class_ = filterDecls . collectDocs . sortLocated $ decls
 declTypeDocs :: HsDecl GhcRn -> Map Int (HsDocString)
 declTypeDocs = \case
   SigD  _ (TypeSig _ _ ty)          -> typeDocs (unLoc (hsSigWcType ty))
-  SigD  _ (ClassOpSig _ _ _ ty)     -> typeDocs (unLoc (hsSigType ty))
-  SigD  _ (PatSynSig _ _ ty)        -> typeDocs (unLoc (hsSigType ty))
+  SigD  _ (ClassOpSig _ _ _ ty)     -> sigTypeDocs (unLoc ty)
+  SigD  _ (PatSynSig _ _ ty)        -> sigTypeDocs (unLoc ty)
   ForD  _ (ForeignImport _ _ ty _)  -> sigTypeDocs (unLoc ty)
   TyClD _ (SynDecl { tcdRhs = ty }) -> typeDocs (unLoc ty)
   _                                 -> M.empty
