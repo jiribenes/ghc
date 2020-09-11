@@ -33,11 +33,11 @@ module GHC.HsToCore.PmCheck.Types (
 
         -- * A 'DIdEnv' where entries may be shared
         Shared(..), SharedDIdEnv(..), emptySDIE, lookupSDIE, sameRepresentativeSDIE,
-        setIndirectSDIE, setEntrySDIE, traverseSDIE,
+        setIndirectSDIE, setEntrySDIE, traverseSDIE, entriesSDIE,
 
         -- * The pattern match oracle
-        BotInfo(..), VarInfo(..), TmState(..), TyState(..), Nabla(..),
-        Nablas(..), initNablas, liftNablasM
+        BotInfo(..), PmAltConApp(..), VarInfo(..), TmState(..), TyState(..),
+        Nabla(..), Nablas(..), initNablas, liftNablasM
     ) where
 
 #include "HsVersions.h"
@@ -51,6 +51,7 @@ import GHC.Types.Id
 import GHC.Types.Var.Env
 import GHC.Types.Unique.DSet
 import GHC.Types.Unique.DFM
+import GHC.Types.Unique.FuelTank
 import GHC.Types.Name
 import GHC.Core.DataCon
 import GHC.Core.ConLike
@@ -485,6 +486,12 @@ setEntrySDIE :: SharedDIdEnv a -> Id -> a -> SharedDIdEnv a
 setEntrySDIE sdie@(SDIE env) x a =
   SDIE $ extendDVarEnv env (fst (lookupReprAndEntrySDIE sdie x)) (Entry a)
 
+entriesSDIE :: SharedDIdEnv a -> [a]
+entriesSDIE (SDIE env) = mapMaybe preview_entry (eltsUDFM env)
+  where
+    preview_entry (Entry e) = Just e
+    preview_entry _         = Nothing
+
 traverseSDIE :: forall a b f. Applicative f => (a -> f b) -> SharedDIdEnv a -> f (SharedDIdEnv b)
 traverseSDIE f = fmap (SDIE . listToUDFM_Directly) . traverse g . udfmToList . unSDIE
   where
@@ -500,13 +507,6 @@ instance Outputable a => Outputable (Shared a) where
 
 instance Outputable a => Outputable (SharedDIdEnv a) where
   ppr (SDIE env) = ppr env
-
--- | See 'vi_bot'.
-data BotInfo
-  = IsBot
-  | IsNotBot
-  | MaybeBot
-  deriving Eq
 
 -- | The term oracle state. Stores 'VarInfo' for encountered 'Id's. These
 -- entries are possibly shared when we figure out that two variables must be
@@ -532,11 +532,11 @@ data TmState
 -- Subject to Note [The Pos/Neg invariant] in "GHC.HsToCore.PmCheck.Oracle".
 data VarInfo
   = VI
-  { vi_ty  :: !Type
-  -- ^ The type of the variable. Important for rejecting possible GADT
-  -- constructors or incompatible pattern synonyms (@Just42 :: Maybe Int@).
+  { vi_id  :: !Id
+  -- ^ The 'Id' in question. Important for adding new constraints relative to
+  -- this 'VarInfo' when we don't easily have the 'Id' available.
 
-  , vi_pos :: ![(PmAltCon, [TyVar], [Id])]
+  , vi_pos :: ![PmAltConApp]
   -- ^ Positive info: 'PmAltCon' apps it is (i.e. @x ~ [Just y, PatSyn z]@), all
   -- at the same time (i.e. conjunctive).  We need a list because of nested
   -- pattern matches involving pattern synonym
@@ -576,6 +576,24 @@ data VarInfo
   -- to recognise completion of a COMPLETE set efficiently for large enums.
   }
 
+data PmAltConApp
+  = PACA
+  { paca_con :: !PmAltCon
+  , paca_tvs :: ![TyVar]
+  , paca_ids :: ![Id]
+  }
+
+-- | See 'vi_bot'.
+data BotInfo
+  = IsBot
+  | IsNotBot
+  | MaybeBot
+  deriving Eq
+
+instance Outputable PmAltConApp where
+  ppr PACA{paca_con = con, paca_tvs = tvs, paca_ids = ids} =
+    hsep (ppr con : map ((char '@' <>) . ppr) tvs ++ map ppr ids)
+
 instance Outputable BotInfo where
   ppr MaybeBot = empty
   ppr IsBot    = text "~⊥"
@@ -608,12 +626,19 @@ initTyState = TySt emptyInert
 -- | A normalised refinement type ∇ (\"nabla\"), comprised of an inert set of
 -- canonical (i.e. mutually compatible) term and type constraints that form the
 -- refinement type's predicate.
-data Nabla = MkNabla { nabla_ty_st :: TyState    -- Type oracle; things like a~Int
-                     , nabla_tm_st :: TmState }  -- Term oracle; things like x~Nothing
+data Nabla
+  = MkNabla
+  { nabla_ty_st :: !TyState
+  -- ^ Type oracle; things like a~Int
+  , nabla_tm_st :: !TmState
+  -- ^ Term oracle; things like x~Nothing
+  , nabla_fuel  :: !(FuelTank ConLike)
+  -- ^ Fuel for inhabitation test
+  }
 
 -- | An initial nabla that is always satisfiable
 initNabla :: Nabla
-initNabla = MkNabla initTyState initTmState
+initNabla = MkNabla initTyState initTmState (initFuelTank 1)
 
 instance Outputable Nabla where
   ppr nabla = hang (text "Nabla") 2 $ vcat [
