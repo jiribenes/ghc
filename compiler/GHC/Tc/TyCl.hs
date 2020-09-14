@@ -58,7 +58,6 @@ import GHC.Core.Class
 import GHC.Core.Coercion.Axiom
 import GHC.Core.TyCon
 import GHC.Core.DataCon
-import GHC.Hs.Decls( newOrDataToFlavour )
 import GHC.Types.Id
 import GHC.Types.Var
 import GHC.Types.Var.Env
