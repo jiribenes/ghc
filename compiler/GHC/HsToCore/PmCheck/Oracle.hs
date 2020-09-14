@@ -4,7 +4,8 @@ Authors: George Karachalias <george.karachalias@cs.kuleuven.be>
          Ryan Scott <ryan.gl.scott@gmail.com>
 -}
 
-{-# LANGUAGE CPP, LambdaCase, TupleSections, PatternSynonyms, ViewPatterns, MultiWayIf, ScopedTypeVariables #-}
+{-# LANGUAGE CPP, LambdaCase, TupleSections, PatternSynonyms, ViewPatterns,
+             MultiWayIf, ScopedTypeVariables, MagicHash #-}
 
 -- | The pattern match oracle. The main export of the module are the functions
 -- 'addPmCts' for adding facts to the oracle, and 'generateInhabitants' to turn a
@@ -60,6 +61,7 @@ import GHC.Types.Unique.Supply
 import GHC.Data.FastString
 import GHC.Types.SrcLoc
 import GHC.Data.Maybe
+import GHC.Data.ListT
 import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.PatSyn
@@ -77,7 +79,7 @@ import GHC.Tc.Instance.Family
 import GHC.Core.FamInstEnv
 
 import Control.Applicative ((<|>))
-import Control.Monad (forM, guard, mzero, when)
+import Control.Monad (filterM, forM, forM_, guard, mzero, when)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict
 import Data.Either   (partitionEithers)
@@ -88,8 +90,8 @@ import Data.Ord      (comparing)
 import Data.Tuple    (swap)
 
 import GHC.Driver.Ppr (pprTrace)
-import Data.Bifunctor (Bifunctor(second))
-import Control.Monad (forM_)
+
+import GHC.Exts (reallyUnsafePtrEquality#, isTrue#)
 
 -- Debugging Infrastructure
 
@@ -128,21 +130,6 @@ mkPmId ty = getUniqueM >>= \unique ->
 trvRcm :: Applicative f => (ConLikeSet -> f ConLikeSet) -> ResidualCompleteMatches -> f ResidualCompleteMatches
 trvRcm f (RCM vanilla pragmas) = RCM <$> traverse f vanilla
                                      <*> traverse (traverse f) pragmas
-
--- | 'mapAccumLM' for 'ResidualCompleteMatches'.
-mapAccumRcmLM
-  :: Monad m
-  => (acc -> ConLikeSet -> m (acc, ConLikeSet))
-  -> acc
-  -> ResidualCompleteMatches
-  -> m (acc, ResidualCompleteMatches)
-mapAccumRcmLM f s (RCM vanilla pragmas) = do
-  (s1, vanilla') <- go_maybe f              s  vanilla
-  (s2, pragmas') <- go_maybe (mapAccumLM f) s1 pragmas
-  return (s2, RCM vanilla' pragmas')
-  where
-    go_maybe _ s Nothing  = return (s, Nothing)
-    go_maybe g s (Just x) = second Just <$> g s x
 
 -- | Update the COMPLETE sets of 'ResidualCompleteMatches'.
 updRcm :: (ConLikeSet -> ConLikeSet) -> ResidualCompleteMatches -> ResidualCompleteMatches
@@ -910,8 +897,11 @@ addPmCts :: Nabla -> PmCts -> DsM (Maybe Nabla)
 -- See Note [TmState invariants].
 addPmCts nabla cts = runMaybeT $ do
   nabla' <- addPmCtsNoTest nabla cts
-  inhabitationTest (nabla_ty_st nabla) nabla'
+  check_non_empty (inhabitationTest 2 (nabla_ty_st nabla) nabla')
   pure nabla'
+  where
+    check_non_empty :: ListT m a -> MaybeT m ()
+    check_non_empty = MaybeT . fold (\_ _ -> return (Just ())) (return Nothing)
 
 -- Why not always perform the inhabitation test immediately after adding type
 -- info? Because of infinite loops. Consider
@@ -1084,22 +1074,48 @@ addNotBotCt nabla@MkNabla{ nabla_tm_st = TmSt env reps } x = do
       vi <- ensureInhabited nabla vi{ vi_bot = IsNotBot }
       pure nabla{ nabla_tm_st = TmSt (setEntrySDIE env y vi) reps}
 
-inhabitationTest :: TyState -> Nabla -> MaybeT DsM ()
-inhabitationTest old_ty_st nabla = work nabla emptyVarSet []
+-- | Not as unsafe as it looks! Quite a cheap test.
+tyStateUnchanged :: TyState -> TyState -> Bool
+tyStateUnchanged a b = isTrue# (reallyUnsafePtrEquality# a b)
+
+inhabitationTest :: Int -> TyState -> Nabla -> ListT DsM Nabla
+inhabitationTest 0     _         nabla             = pure nabla
+inhabitationTest _fuel old_ty_st nabla
+  | tyStateUnchanged old_ty_st (nabla_ty_st nabla) = pure nabla
+inhabitationTest fuel  old_ty_st nabla@MkNabla{ nabla_tm_st = TmSt env _} = do
+  nablas' <- work nabla (map vi_id $ entriesSDIE env)
+  anyM (inhabitationTest (fuel-1) (nabla_ty_st nabla)) nablas'
   where
-    -- | Test every 'Id' in the list by instantiation. If empty, try again with
-    -- new roots that we haven't visited yet. Succeed otherwise.
-    work :: Nabla -> IdSet -> [Id] -> MaybeT DsM ()
-    work nabla@MkNabla{ nabla_tm_st = TmSt env _ } visited [] = do
-      let new_roots = filter (\x -> not (x `elemVarSet` visited))
-                    $ map vi_id $ entriesSDIE env
-      case new_roots of
-        [] -> pure () -- Done!
-        _  -> work nabla visited new_roots
-    work nabla visited (x:xs) = do
+    -- | Test every 'Id' in the list by instantiation.
+    work :: Nabla -> [Id] -> ListT DsM Nabla
+    work nabla []     = pure nabla
+    work nabla (x:xs) = do
       (_vi, nablas') <- instantiate nabla x
-      -- all nablas' (being the different constructors from must be inhabited!
-      forM_ nablas' $ \nabla' -> work nabla' (extendVarSet visited x) xs
+      forM nablas' $ \nabla' -> work nabla' xs
+
+-- | Checks whether the given 'VarInfo' needs to checked for inhabitants.
+-- It doesn't need to be if any of the following predicates holds:
+--
+--   1. The 'TyState' didn't change ('tyStateUnchanged')
+--   2. Its representation type didn't change compared to the old 'TyState'
+needsTest :: TyState -> TyState -> VarInfo -> DsM Bool
+needsTest old_ty_st new_ty_st _
+  | tyStateUnchanged old_ty_st new_ty_st = pure False
+needsTest old_ty_st new_ty_st vi = do
+  (_, _, old_rep_ty) <- tntrGuts <$> pmTopNormaliseType old_ty_st (idType $ vi_id vi)
+  (_, _, new_rep_ty) <- tntrGuts <$> pmTopNormaliseType new_ty_st (idType $ vi_id vi)
+  if old_rep_ty `eqType` new_rep_ty
+    then pure False
+    else case splitTyConApp_maybe new_rep_ty of
+      Just (tc, _args)
+        | Just dcs <- tyConDataCons_maybe tc -> pure (any meets_criteria dcs)
+      _                                      -> pure True
+  where
+    meets_criteria :: DataCon -> Bool
+    meets_criteria (_, con, _) =
+      null (dataConEqSpec con) && -- (1)
+      null (dataConImplBangs con) -- (2)
+
 
 -- | Returns (Just vi) if at least one member of each ConLike in the COMPLETE
 -- set satisfies the oracle
@@ -1109,13 +1125,16 @@ inhabitationTest old_ty_st nabla = work nabla emptyVarSet []
 -- NB: Does /not/ filter each ConLikeSet with the oracle; members may
 --     remain that do not statisfy it.  This lazy approach just
 --     avoids doing unnecessary work.
-instantiate :: Nabla -> Id -> MaybeT DsM (VarInfo, [Nabla])
-instantiate nabla x = instBot nabla x <|> instCompleteSets nabla x
+instantiate :: Nabla -> Id -> ListT DsM (VarInfo, [Nabla])
+instantiate nabla x = instBot nabla x <|.> instCompleteSets nabla x
+
+maybeToListT :: Monad m => MaybeT m a -> ListT m a
+maybeToListT m = lift (runMaybeT m) >>= maybe mzero return
 
 -- | The \(⊢_{Bot}\) rule from the paper
-instBot :: Nabla -> Id -> MaybeT DsM (VarInfo, [Nabla])
+instBot :: Nabla -> Id -> ListT DsM (VarInfo, [Nabla])
 instBot nabla@MkNabla{ nabla_tm_st = ts } x = do
-  nabla' <- addBotCt nabla x
+  nabla' <- maybeToListT $ addBotCt nabla x
   pure (lookupVarInfo ts x, [nabla'])
 
 overVarInfo :: Functor f => (VarInfo -> f (a, VarInfo)) -> Nabla -> Id -> f (a, Nabla)
@@ -1148,7 +1167,7 @@ reprTyCon_maybe ty = case splitTyConApp_maybe ty of
 -- constructors. If there is any complete set where we can't find an
 -- inhabitant, the whole thing is uninhabited. It returns one 'Nabla' for each
 -- instantiated constructor.
-instCompleteSets :: Nabla -> Id -> MaybeT DsM (VarInfo, [Nabla])
+instCompleteSets :: Nabla -> Id -> ListT DsM (VarInfo, [Nabla])
 instCompleteSets nabla@MkNabla{ nabla_tm_st = ts } x = do
   (rcm, nabla') <- lift (addNormalisedTypeMatches nabla x)
   (uninst_nabla, inst_nablas) <- mapAccumLM do_one_cmpl_set nabla' (getRcm rcm)
@@ -1311,11 +1330,6 @@ equate nabla@MkNabla{ nabla_tm_st = TmSt env reps } x y
         -- vi_rcm will be updated in addNotConCt, so we are good to
         -- go!
         pure nabla_neg
-
--- | Determines the 'PmEquality' relation between the given 'PmAltCon' and the
--- 'PmAltCon' of the solution in the second parameter.
-eqSolutionAlt :: PmAltCon -> (PmAltCon, [TyVar], [Id]) -> PmEquality
-eqSolutionAlt alt (alt', _, _) = eqPmAltCon alt alt'
 
 -- | Add a @x ~ K tvs args ts@ constraint.
 -- @addConCt x K tvs args ts@ extends the substitution with a solution
