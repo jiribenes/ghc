@@ -3,6 +3,13 @@
 Version 9.2.1
 ==============
 
+Highlights
+----------
+
+* GHC now has much better support  for :extension:`impredicative types
+  <ImpredicativeTypes>`, as described in *A quick look at impredicativity*
+  (ICFP 2020).
+
 Compiler
 ~~~~~~~~
 
