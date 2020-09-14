@@ -858,7 +858,7 @@ qlUnify delta ty1 ty2
         let ty2_tvs = shallowTyCoVarsOfType ty2
       , not (ty2_tvs `intersectsVarSet` bvs2)
           -- Can't instantiate a delta-varto a forall-bound variable
-      , Just ty2' <- occCheckExpand [kappa] ty2
+      , Just _ty2' <- occCheckExpand [kappa] ty2
           -- Passes the occurs check
       = do { co <- unifyKind (Just (ppr ty2)) ty2_kind kappa_kind
                    -- unifyKind: see Note [Actual unification in qlUnify]
