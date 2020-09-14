@@ -48,7 +48,6 @@ import GHC.Types.Unique.DFM
 import GHC.Types.Unique.FuelTank
 import GHC.Types.Id
 import GHC.Types.Var.Env
-import GHC.Types.Var.Set
 import GHC.Types.Var      (EvVar)
 import GHC.Types.Name
 import GHC.Core
@@ -61,7 +60,6 @@ import GHC.Types.Unique.Supply
 import GHC.Data.FastString
 import GHC.Types.SrcLoc
 import GHC.Data.Maybe
-import GHC.Data.ListT
 import GHC.Core.ConLike
 import GHC.Core.DataCon
 import GHC.Core.PatSyn
@@ -79,11 +77,12 @@ import GHC.Tc.Instance.Family
 import GHC.Core.FamInstEnv
 
 import Control.Applicative ((<|>))
-import Control.Monad (filterM, forM, forM_, guard, mzero, when)
+import Control.Monad (foldM, forM, guard, mzero, when)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict
 import Data.Either   (partitionEithers)
 import Data.Foldable (foldlM, minimumBy, toList)
+import Data.Functor.Identity
 import Data.List     (find)
 import qualified Data.List.NonEmpty as NE
 import Data.Ord      (comparing)
@@ -748,7 +747,15 @@ emptyVarInfo :: Id -> VarInfo
 -- After all, there are also strict fields, the unliftedness of which isn't
 -- evident in the type. So treating unlifted types here would never be
 -- sufficient anyway.
-emptyVarInfo x = VI x [] emptyPmAltConSet MaybeBot emptyRCM
+emptyVarInfo x
+  = VI
+  { vi_id = x
+  , vi_pos = []
+  , vi_neg = emptyPmAltConSet
+  , vi_bot = MaybeBot
+  , vi_rcm = emptyRCM
+  , vi_dirty = False
+  }
 
 lookupVarInfo :: TmState -> Id -> VarInfo
 -- (lookupVarInfo tms x) tells what we know about 'x'
@@ -897,11 +904,8 @@ addPmCts :: Nabla -> PmCts -> DsM (Maybe Nabla)
 -- See Note [TmState invariants].
 addPmCts nabla cts = runMaybeT $ do
   nabla' <- addPmCtsNoTest nabla cts
-  check_non_empty (inhabitationTest 2 (nabla_ty_st nabla) nabla')
+  inhabitationTest 2 (nabla_ty_st nabla) nabla'
   pure nabla'
-  where
-    check_non_empty :: ListT m a -> MaybeT m ()
-    check_non_empty = MaybeT . fold (\_ _ -> return (Just ())) (return Nothing)
 
 -- Why not always perform the inhabitation test immediately after adding type
 -- info? Because of infinite loops. Consider
@@ -976,7 +980,7 @@ addNotConCt :: Nabla -> Id -> PmAltCon -> MaybeT DsM Nabla
 addNotConCt _ _ (PmAltConLike (RealDataCon dc))
   | isNewDataCon dc = mzero -- (3) in Note [Coverage checking Newtype matches]
 addNotConCt nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x nalt = do
-  let vi@(VI _ pos neg _ rcm) = lookupVarInfo ts x
+  let vi@(VI _ pos neg _ rcm _) = lookupVarInfo ts x
   -- 1. Bail out quickly when nalt contradicts a solution
   let contradicts nalt sol = eqPmAltCon (paca_con sol) nalt == Equal
   guard (not (any (contradicts nalt) pos))
@@ -993,8 +997,9 @@ addNotConCt nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x nalt = do
   -- 3. Make sure there's at least one other possible constructor
   vi2 <- case nalt of
     PmAltConLike cl -> do
+      -- Mark dirty to force a delayed inhabitation test
       rcm' <- lift (markMatched cl rcm)
-      ensureInhabited nabla vi1{ vi_rcm = rcm' }
+      pure vi1{ vi_rcm = rcm', vi_dirty = True }
     _ ->
       pure vi1
   pure nabla{ nabla_tm_st = TmSt (setEntrySDIE env x vi2) reps }
@@ -1071,50 +1076,60 @@ addNotBotCt nabla@MkNabla{ nabla_tm_st = TmSt env reps } x = do
     IsBot    -> mzero      -- There was x ~ ⊥. Contradiction!
     IsNotBot -> pure nabla -- There already is x ≁ ⊥. Nothing left to do
     MaybeBot -> do         -- We add x ≁ ⊥ and test if x is still inhabited
-      vi <- ensureInhabited nabla vi{ vi_bot = IsNotBot }
-      pure nabla{ nabla_tm_st = TmSt (setEntrySDIE env y vi) reps}
+      -- Mark dirty for a delayed inhabitation test
+      let vi' = vi{ vi_bot = IsNotBot, vi_dirty = True }
+      pure nabla{ nabla_tm_st = TmSt (setEntrySDIE env y vi') reps}
 
 -- | Not as unsafe as it looks! Quite a cheap test.
 tyStateUnchanged :: TyState -> TyState -> Bool
 tyStateUnchanged a b = isTrue# (reallyUnsafePtrEquality# a b)
 
-inhabitationTest :: Int -> TyState -> Nabla -> ListT DsM Nabla
+inhabitationTest :: Int -> TyState -> Nabla -> MaybeT DsM Nabla
 inhabitationTest 0     _         nabla             = pure nabla
-inhabitationTest _fuel old_ty_st nabla
-  | tyStateUnchanged old_ty_st (nabla_ty_st nabla) = pure nabla
-inhabitationTest fuel  old_ty_st nabla@MkNabla{ nabla_tm_st = TmSt env _} = do
-  nablas' <- work nabla (map vi_id $ entriesSDIE env)
-  anyM (inhabitationTest (fuel-1) (nabla_ty_st nabla)) nablas'
+inhabitationTest fuel  old_ty_st nabla@MkNabla{ nabla_tm_st = TmSt env reps} = do
+  env' <- traverseSDIE test_one env
+  pure nabla{ nabla_tm_st = TmSt env' reps }
   where
-    -- | Test every 'Id' in the list by instantiation.
-    work :: Nabla -> [Id] -> ListT DsM Nabla
-    work nabla []     = pure nabla
-    work nabla (x:xs) = do
-      (_vi, nablas') <- instantiate nabla x
-      forM nablas' $ \nabla' -> work nabla' xs
+    test_one :: VarInfo -> MaybeT DsM VarInfo
+    test_one vi =
+      lift (varNeedsTesting old_ty_st (nabla_ty_st nabla) vi) >>= \case
+        True  -> instantiate (fuel-1) nabla vi
+        False -> pure vi
 
--- | Checks whether the given 'VarInfo' needs to checked for inhabitants.
--- It doesn't need to be if any of the following predicates holds:
+-- | Checks whether the given 'VarInfo' needs to be tested for inhabitants.
 --
---   1. The 'TyState' didn't change ('tyStateUnchanged')
---   2. Its representation type didn't change compared to the old 'TyState'
-needsTest :: TyState -> TyState -> VarInfo -> DsM Bool
-needsTest old_ty_st new_ty_st _
+--     1. If it's marked dirty because of new negative term constraints, we have
+--        to test.
+--     2. Otherwise, if the type state didn't change, we don't need to test.
+--     3. If the type state changed, we compare representation types. No need
+--        to test if unchanged.
+--     4. If all the constructors of a TyCon are vanilla, we don't have to test.
+--        "vanilla" = No strict fields and not GADT-like.
+-- It doesn't need to if it isn't marked dirty because of new negative type
+-- constraints /and/ its representation type didn't change compared to the old
+-- 'TyState' from the last inhabitation test.
+varNeedsTesting :: TyState -> TyState -> VarInfo -> DsM Bool
+varNeedsTesting _         _         vi
+  | vi_dirty vi = pure True
+varNeedsTesting old_ty_st new_ty_st _
+  -- Same type state => still inhabited
   | tyStateUnchanged old_ty_st new_ty_st = pure False
-needsTest old_ty_st new_ty_st vi = do
+varNeedsTesting old_ty_st new_ty_st vi = do
   (_, _, old_rep_ty) <- tntrGuts <$> pmTopNormaliseType old_ty_st (idType $ vi_id vi)
   (_, _, new_rep_ty) <- tntrGuts <$> pmTopNormaliseType new_ty_st (idType $ vi_id vi)
   if old_rep_ty `eqType` new_rep_ty
     then pure False
     else case splitTyConApp_maybe new_rep_ty of
       Just (tc, _args)
-        | Just dcs <- tyConDataCons_maybe tc -> pure (any meets_criteria dcs)
-      _                                      -> pure True
+        | Just dcs <- tyConDataCons_maybe tc
+        , lengthAtMost dcs 10
+        -> pure (any non_vanilla_dc dcs)
+      _ -> pure True
   where
-    meets_criteria :: DataCon -> Bool
-    meets_criteria (_, con, _) =
-      null (dataConEqSpec con) && -- (1)
-      null (dataConImplBangs con) -- (2)
+    non_vanilla_dc :: DataCon -> Bool
+    non_vanilla_dc con =
+      notNull (dataConTheta con) || -- (1)
+      notNull (dataConImplBangs con) -- (2)
 
 
 -- | Returns (Just vi) if at least one member of each ConLike in the COMPLETE
@@ -1125,23 +1140,25 @@ needsTest old_ty_st new_ty_st vi = do
 -- NB: Does /not/ filter each ConLikeSet with the oracle; members may
 --     remain that do not statisfy it.  This lazy approach just
 --     avoids doing unnecessary work.
-instantiate :: Nabla -> Id -> ListT DsM (VarInfo, [Nabla])
-instantiate nabla x = instBot nabla x <|.> instCompleteSets nabla x
-
-maybeToListT :: Monad m => MaybeT m a -> ListT m a
-maybeToListT m = lift (runMaybeT m) >>= maybe mzero return
+instantiate :: Int -> Nabla -> VarInfo -> MaybeT DsM VarInfo
+instantiate fuel nabla vi = instBot fuel nabla vi <|> instCompleteSets fuel nabla vi
 
 -- | The \(⊢_{Bot}\) rule from the paper
-instBot :: Nabla -> Id -> ListT DsM (VarInfo, [Nabla])
-instBot nabla@MkNabla{ nabla_tm_st = ts } x = do
-  nabla' <- maybeToListT $ addBotCt nabla x
-  pure (lookupVarInfo ts x, [nabla'])
+instBot :: Int -> Nabla -> VarInfo -> MaybeT DsM VarInfo
+instBot _fuel nabla vi = do
+  _nabla' <- addBotCt nabla (vi_id vi)
+  pure vi{vi_dirty = False} -- We just found an inhabitant! Not dirty anymore.
 
 overVarInfo :: Functor f => (VarInfo -> f (a, VarInfo)) -> Nabla -> Id -> f (a, Nabla)
 overVarInfo f nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x
   = set_vi <$> f (lookupVarInfo ts x)
   where
-    set_vi (a, vi') = (a, nabla{ nabla_tm_st = TmSt (setEntrySDIE env (vi_id vi') vi') reps })
+    set_vi (a, vi') =
+      (a, nabla{ nabla_tm_st = TmSt (setEntrySDIE env (vi_id vi') vi') reps })
+
+modifyVarInfo :: (VarInfo -> VarInfo) -> Nabla -> Id -> Nabla
+modifyVarInfo f nabla x = runIdentity $
+  snd <$> overVarInfo (\vi -> pure ((), f vi)) nabla x
 
 addNormalisedTypeMatches :: Nabla -> Id -> DsM (ResidualCompleteMatches, Nabla)
 addNormalisedTypeMatches nabla@MkNabla{ nabla_ty_st = ty_st } x
@@ -1167,15 +1184,12 @@ reprTyCon_maybe ty = case splitTyConApp_maybe ty of
 -- constructors. If there is any complete set where we can't find an
 -- inhabitant, the whole thing is uninhabited. It returns one 'Nabla' for each
 -- instantiated constructor.
-instCompleteSets :: Nabla -> Id -> ListT DsM (VarInfo, [Nabla])
-instCompleteSets nabla@MkNabla{ nabla_tm_st = ts } x = do
+instCompleteSets :: Int -> Nabla -> VarInfo -> MaybeT DsM VarInfo
+instCompleteSets fuel nabla vi = do
+  let x = vi_id vi
   (rcm, nabla') <- lift (addNormalisedTypeMatches nabla x)
-  (uninst_nabla, inst_nablas) <- mapAccumLM do_one_cmpl_set nabla' (getRcm rcm)
-  pure (lookupVarInfo (nabla_tm_st uninst_nabla) x, reverse inst_nablas)
-  where
-    do_one_cmpl_set uninst_nabla cls = do
-      (uninst_nabla', inst_nabla) <- instCompleteSet uninst_nabla (lookupVarInfo ts x) cls
-      pure (uninst_nabla', inst_nabla)
+  nabla' <- foldM (\nabla cls -> instCompleteSet fuel nabla x cls) nabla' (getRcm rcm)
+  pure (lookupVarInfo (nabla_tm_st nabla') x)
 
 anyConLikeSolution :: (ConLike -> Bool) -> [PmAltConApp] -> Bool
 anyConLikeSolution p = any (go . paca_con)
@@ -1183,34 +1197,36 @@ anyConLikeSolution p = any (go . paca_con)
     go (PmAltConLike cl) = p cl
     go _                 = False
 
-instCompleteSet :: Nabla -> VarInfo -> ConLikeSet -> MaybeT DsM (Nabla, Nabla)
+instCompleteSet :: Int -> Nabla -> Id -> ConLikeSet -> MaybeT DsM Nabla
 -- (instCompleteSet nabla vi cs cls) iterates over cls, deleting from cs
 -- any uninhabited elements of cls.  Stop (returning Just (nabla', cs))
 -- when you see an inhabited element; return Nothing if all are uninhabited
-instCompleteSet nabla vi cs
+instCompleteSet fuel nabla x cs
   | anyConLikeSolution (`elementOfUniqDSet` cs) (vi_pos vi)
   -- No need to instantiate a constructor of this COMPLETE set if we already
   -- have a solution!
-  = pure (nabla, nabla)
+  = pure nabla
   | otherwise
-  = go nabla vi (uniqDSetToList cs)
+  = go nabla (uniqDSetToList cs)
   where
-    go :: Nabla -> VarInfo -> [ConLike] -> MaybeT DsM (Nabla, Nabla)
-    go _     _  []         = mzero
-    go nabla vi (con:cons)
-      -- If a previous iteration added a a new negative constraint that @cons@
-      -- wasn't pruned of, we can detect so early and not even try instantiating
-      -- @con@.
-      | PmAltConLike con `elemPmAltConSet` vi_neg vi = go nabla vi cons
-    go nabla vi (con:cons) = do
+    vi = lookupVarInfo (nabla_tm_st nabla) x
+
+    go :: Nabla -> [ConLike] -> MaybeT DsM Nabla
+    go _     []         = mzero
+    go nabla (con:cons) = do
       let x = vi_id vi
       lift (mkOneConFull nabla x con) >>= \case
-        Just nabla' -> pure (nabla, nabla')
+        Just nabla' -> do
+          _nabla' <- inhabitationTest fuel (nabla_ty_st nabla) nabla'
+          -- nabla' is inhabited, which is what we were trying to prove. But
+          -- nabla' is also a possibly proper subset of nabla, so we have to
+          -- return the old nabla and lose all the work we did.
+          pure $ modifyVarInfo (\vi -> vi{vi_dirty = False}) nabla x
         Nothing     -> do
           -- We just proved that x can't be con. Encode that fact with addNotConCt.
           nabla' <- addNotConCt nabla x (PmAltConLike con)
-          let vi' = lookupVarInfo (nabla_tm_st nabla) x
-          go nabla' vi' cons
+          go nabla' cons
+
 
 -- | Returns (Just vi) if at least one member of each ConLike in the COMPLETE
 -- set satisfies the oracle
@@ -1339,7 +1355,7 @@ equate nabla@MkNabla{ nabla_tm_st = TmSt env reps } x y
 -- See Note [TmState invariants].
 addConCt :: Nabla -> Id -> PmAltCon -> [TyVar] -> [Id] -> MaybeT DsM Nabla
 addConCt nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x alt tvs args = do
-  let VI ty pos neg bot rcm = lookupVarInfo ts x
+  let vi@(VI _ pos neg bot _ _) = lookupVarInfo ts x
   -- First try to refute with a negative fact
   guard (not (elemPmAltConSet alt neg))
   -- Then see if any of the other solutions (remember: each of them is an
@@ -1358,8 +1374,8 @@ addConCt nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x alt tvs args = do
       MaybeT $ addPmCts nabla (listToBag ty_cts `unionBags` listToBag tm_cts)
     Nothing -> do
       let pos' = PACA alt tvs args : pos
-      let nabla_with bot =
-            nabla{ nabla_tm_st = TmSt (setEntrySDIE env x (VI ty pos' neg bot rcm)) reps}
+      let nabla_with bot' =
+            nabla{ nabla_tm_st = TmSt (setEntrySDIE env x (vi{vi_pos = pos', vi_bot = bot'})) reps}
       -- Do (2) in Note [Coverage checking Newtype matches]
       case (alt, args) of
         (PmAltConLike (RealDataCon dc), [y]) | isNewDataCon dc ->
@@ -1787,7 +1803,7 @@ generateInhabitants _      0 _     = pure []
 generateInhabitants []     _ nabla = pure [nabla]
 generateInhabitants (x:xs) n nabla = do
   tracePm "generateInhabitants" (ppr x $$ ppr xs $$ ppr nabla)
-  let VI _ pos neg _ _ = lookupVarInfo (nabla_tm_st nabla) x
+  let VI _ pos neg _ _ _ = lookupVarInfo (nabla_tm_st nabla) x
   case pos of
     _:_ -> do
       -- All solutions must be valid at once. Try to find candidates for their
@@ -1832,11 +1848,11 @@ generateInhabitants (x:xs) n nabla = do
             Just clss -> do
               -- Try each COMPLETE set, pick the one with the smallest number of
               -- inhabitants
-              nablass <- forM clss (instantiate_cons y rep_ty xs n newty_nabla)
-              let nablas = minimumBy (comparing length) nablass
-              if null nablas && vi_bot vi /= IsNotBot
+              nablass' <- forM clss (instantiate_cons y rep_ty xs n newty_nabla)
+              let nablas' = minimumBy (comparing length) nablass'
+              if null nablas' && vi_bot vi /= IsNotBot
                 then generateInhabitants xs n newty_nabla -- bot is still possible. Display a wildcard!
-                else pure nablas
+                else pure nablas'
 
     -- | Instantiates a chain of newtypes, beginning at @x@.
     -- Turns @x nabla [T,U,V]@ to @(y, nabla')@, where @nabla'@ we has the fact

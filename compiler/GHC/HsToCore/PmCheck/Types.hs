@@ -574,6 +574,10 @@ data VarInfo
   -- possible constructors of each COMPLETE set. So, if it's not in here, we
   -- can't possibly match on it. Complementary to 'vi_neg'. We still need it
   -- to recognise completion of a COMPLETE set efficiently for large enums.
+
+  , vi_dirty :: !Bool
+  -- ^ Whether this 'VarInfo' needs to be checked for inhabitants because of new
+  -- negative constraints (e.g. @x ≁ ⊥@ or @x ≁ K@).
   }
 
 data PmAltConApp
@@ -605,15 +609,18 @@ instance Outputable TmState where
 
 -- | Not user-facing.
 instance Outputable VarInfo where
-  ppr (VI ty pos neg bot cache)
-    = braces (hcat (punctuate comma [ppr ty, ppr pos, ppr neg, ppr bot, ppr cache]))
+  ppr (VI ty pos neg bot cache dirty)
+    = braces (hcat (punctuate comma [ppr ty, ppr pos, ppr neg, ppr bot, ppr cache, pp_dirty]))
+    where
+      pp_dirty | dirty     = text "dirty"
+               | otherwise = empty
 
 -- | Initial state of the term oracle.
 initTmState :: TmState
 initTmState = TmSt emptySDIE emptyCoreMap
 
--- | The type oracle state. A poor man's 'GHC.Tc.Solver.Monad.InsertSet': The invariant is
--- that all constraints in there are mutually compatible.
+-- | The type oracle state. An 'GHC.Tc.Solver.Monad.InsertSet' that we
+-- incrementally add local type constraints to.
 newtype TyState = TySt InertSet
 
 -- | Not user-facing.
