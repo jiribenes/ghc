@@ -850,12 +850,12 @@ instance Outputable a => Outputable (CheckResult a) where
       field name value = text name <+> equals <+> ppr value
 
 -- | Lift 'addPmCts' over 'Nablas'.
-addPmCtsNablas :: Nablas -> PmCts -> DsM Nablas
-addPmCtsNablas nablas cts = liftNablasM (\d -> addPmCts d cts) nablas
+addPhiCtsNablas :: Nablas -> PhiCts -> DsM Nablas
+addPhiCtsNablas nablas cts = liftNablasM (\d -> addPhiCts d cts) nablas
 
 -- | 'addPmCtsNablas' for a single 'PmCt'.
-addPmCtNablas :: Nablas -> PmCt -> DsM Nablas
-addPmCtNablas nablas ct = addPmCtsNablas nablas (unitBag ct)
+addPhiCtNablas :: Nablas -> PhiCt -> DsM Nablas
+addPhiCtNablas nablas ct = addPhiCtsNablas nablas (unitBag ct)
 
 -- | Test if any of the 'Nabla's is inhabited. Currently this is pure, because
 -- we preserve the invariant that there are no uninhabited 'Nabla's. But that
@@ -927,15 +927,15 @@ checkGrd :: PmGrd -> CheckAction RedSets
 checkGrd grd = CA $ \inc -> case grd of
   -- let x = e: Refine with x ~ e
   PmLet x e -> do
-    matched <- addPmCtNablas inc (PmCoreCt x e)
+    matched <- addPhiCtNablas inc (PhiCoreCt x e)
     -- tracePm "check:Let" (ppr x <+> char '=' <+> ppr e)
     pure CheckResult { cr_ret = emptyRedSets { rs_cov = matched }
                      , cr_uncov = mempty
                      , cr_approx = Precise }
   -- Bang x _: Diverge on x ~ ⊥, refine with x ≁ ⊥
   PmBang x mb_info -> do
-    div <- addPmCtNablas inc (PmBotCt x)
-    matched <- addPmCtNablas inc (PmNotBotCt x)
+    div <- addPhiCtNablas inc (PhiBotCt x)
+    matched <- addPhiCtNablas inc (PhiNotBotCt x)
     -- See Note [Dead bang patterns]
     -- mb_info = Just info <==> PmBang originates from bang pattern in source
     let bangs | Just info <- mb_info = unitOL (div, info)
@@ -947,11 +947,10 @@ checkGrd grd = CA $ \inc -> case grd of
   -- Con: Fall through on x ≁ K and refine with x ~ K ys and type info
   PmCon x con tvs dicts args -> do
     !div <- if isPmAltConMatchStrict con
-      then addPmCtNablas inc (PmBotCt x)
+      then addPhiCtNablas inc (PhiBotCt x)
       else pure mempty
-    let con_cts = phiConCts x con tvs (map evVarPred dicts) args
-    !matched <- addPmCtsNablas inc con_cts
-    !uncov   <- addPmCtNablas  inc (PmNotConCt x con)
+    !matched <- addPhiCtNablas inc (PhiConCt x con tvs (map evVarPred dicts) args)
+    !uncov   <- addPhiCtNablas inc (PhiNotConCt x con)
     -- tracePm "checkGrd:Con" (ppr inc $$ ppr grd $$ ppr con_cts $$ ppr matched)
     pure CheckResult { cr_ret = emptyRedSets { rs_cov = matched, rs_div = div }
                      , cr_uncov = uncov
@@ -986,7 +985,7 @@ checkGRHS (PmGRHS { pg_grds = grds, pg_rhs = rhs_info }) =
 
 checkEmptyCase :: PmEmptyCase -> CheckAction PmEmptyCase
 checkEmptyCase pe@(PmEmptyCase { pe_var = var }) = CA $ \inc -> do
-  unc <- addPmCtNablas inc (PmNotBotCt var)
+  unc <- addPhiCtNablas inc (PhiNotBotCt var)
   pure CheckResult { cr_ret = pe, cr_uncov = unc, cr_approx = mempty }
 
 checkPatBind :: (PmPatBind Pre) -> CheckAction (PmPatBind Post)
@@ -1373,7 +1372,8 @@ addTyCs :: Origin -> Bag EvVar -> DsM a -> DsM a
 addTyCs origin ev_vars m = do
   dflags <- getDynFlags
   applyWhen (needToRunPmCheck dflags origin)
-            (locallyExtendPmNablas (\nablas -> addPmCtsNablas nablas (PmTyCt . evVarPred <$> ev_vars)))
+            (locallyExtendPmNablas $ \nablas ->
+              addPhiCtsNablas nablas (PhiTyCt . evVarPred <$> ev_vars))
             m
 
 -- | Add equalities for the 'CoreExpr' scrutinee to the local 'DsM' environment
@@ -1385,7 +1385,7 @@ addCoreScrutTmCs :: Maybe CoreExpr -> [Id] -> DsM a -> DsM a
 addCoreScrutTmCs Nothing    _   k = k
 addCoreScrutTmCs (Just scr) [x] k =
   flip locallyExtendPmNablas k $ \nablas ->
-    addPmCtsNablas nablas (unitBag (PmCoreCt x scr))
+    addPhiCtsNablas nablas (unitBag (PhiCoreCt x scr))
 addCoreScrutTmCs _   _   _ = panic "addCoreScrutTmCs: scrutinee, but more than one match id"
 
 -- | 'addCoreScrutTmCs', but desugars the 'LHsExpr' first.

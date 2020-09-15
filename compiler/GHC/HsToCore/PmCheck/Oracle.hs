@@ -8,7 +8,7 @@ Authors: George Karachalias <george.karachalias@cs.kuleuven.be>
              MultiWayIf, ScopedTypeVariables, MagicHash #-}
 
 -- | The pattern match oracle. The main export of the module are the functions
--- 'addPmCts' for adding facts to the oracle, and 'generateInhabitants' to turn a
+-- 'addPhiCts' for adding facts to the oracle, and 'generateInhabitants' to turn a
 -- 'Nabla' into a concrete evidence for an equation.
 --
 -- In terms of the [Lower Your Guards paper](https://dl.acm.org/doi/abs/10.1145/3408989)
@@ -19,12 +19,9 @@ module GHC.HsToCore.PmCheck.Oracle (
         DsM, tracePm, mkPmId,
         Nabla, initNablas, lookupRefuts, lookupSolution,
 
-        PmCt(PmTyCt), PmCts, pattern PmVarCt, pattern PmCoreCt,
-        pattern PmConCt, pattern PmNotConCt, pattern PmBotCt,
-        pattern PmNotBotCt,
+        PhiCt(..), PhiCts,
 
-        addPmCts,           -- Add a constraint to the oracle.
-        phiConCts,          -- desugar a higher-level φ constructor constraint
+        addPhiCts,           -- Add a constraint to the oracle.
         generateInhabitants
     ) where
 
@@ -81,7 +78,6 @@ import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State.Strict
 import Data.Either   (partitionEithers)
 import Data.Foldable (foldlM, minimumBy, toList)
-import Data.Functor.Identity
 import Data.List     (find)
 import qualified Data.List.NonEmpty as NE
 import Data.Ord      (comparing)
@@ -102,8 +98,8 @@ tracePm herald doc = do
 {-# INLINE tracePm #-}  -- see Note [INLINE conditional tracing utilities]
 
 debugOn :: () -> Bool
--- debugOn _ = False
-debugOn _ = True
+debugOn _ = False
+-- debugOn _ = True
 
 trc :: String -> SDoc -> a -> a
 trc | debugOn () = pprTrace
@@ -123,11 +119,6 @@ mkPmId ty = getUniqueM >>= \unique ->
 -- * Caching possible matches of a COMPLETE set
 
 -- See Note [Implementation of COMPLETE pragmas]
-
--- | Traverse the COMPLETE sets of 'ResidualCompleteMatches'.
-trvRcm :: Applicative f => (ConLikeSet -> f ConLikeSet) -> ResidualCompleteMatches -> f ResidualCompleteMatches
-trvRcm f (RCM vanilla pragmas) = RCM <$> traverse f vanilla
-                                     <*> traverse (traverse f) pragmas
 
 -- | Update the COMPLETE sets of 'ResidualCompleteMatches'.
 updRcm :: (ConLikeSet -> ConLikeSet) -> ResidualCompleteMatches -> ResidualCompleteMatches
@@ -235,30 +226,6 @@ applies due to refined type information.
 ---------------------------------------------------
 -- * Instantiating constructors, types and evidence
 
--- | The 'PmCts' arising from a successful  'PmCon' match @T gammas as ys <- x@.
--- These include
---
---   * @gammas@: Constraints arising from the bound evidence vars
---   * @y ≁ ⊥@ constraints for each unlifted field (including strict fields)
---     @y@ in @ys@
---   * The constructor constraint itself: @x ~ T as ys@.
---
--- See Note [Strict fields and fields of unlifted type]. TODO
---
--- In terms of the paper, this function amounts to the constructor constraint
--- case of \(⊕_φ\) in Figure 7, which "desugars" higher-level φ constraints
--- into lower-level δ constraints.
-phiConCts :: Id -> PmAltCon -> [TyVar] -> [PredType] -> [Id] -> PmCts
-phiConCts x con tvs dicts args = (gammas `snocBag` con_ct) `unionBags` unlifted
-  where
-    gammas   = listToBag $ map PmTyCt dicts
-    con_ct   = PmConCt x con tvs args
-    unlifted = listToBag [ PmNotBotCt arg
-                         | (arg, bang) <-
-                             zipEqual "pmConCts" args (pmAltConImplBangs con)
-                         , isBanged bang || isUnliftedType (idType arg)
-                         ]
-
 -- | Instantiate a 'ConLike' given its universal type arguments. Instantiates
 -- existential and term binders with fresh variables of appropriate type.
 -- Returns instantiated type and term variables from the match, type evidence
@@ -289,7 +256,6 @@ mkOneConFull nabla@MkNabla{nabla_ty_st = ty_st} x con = do
   env <- dsGetFamInstEnvs
   src_ty <- normalisedSourceType <$> pmTopNormaliseType ty_st (idType x)
   let mb_arg_tys = guessConLikeUnivTyArgsFromResTy env src_ty con
-  tracePm "guess" (ppr src_ty $$ ppr mb_arg_tys)
   case mb_arg_tys of
     Just arg_tys -> do
       let (univ_tvs, ex_tvs, eq_spec, thetas, _req_theta, field_tys, _con_res_ty)
@@ -313,7 +279,8 @@ mkOneConFull nabla@MkNabla{nabla_ty_st = ty_st} x con = do
         , ppr gammas
         , ppr (map (\x -> ppr x <+> dcolon <+> ppr (idType x)) arg_ids)
         ]
-      runMaybeT $ addPmCtsNoTest nabla $ phiConCts x (PmAltConLike con) ex_tvs gammas arg_ids
+      -- Note that we add a
+      runMaybeT $ addPhiCt nabla (PhiConCt x (PmAltConLike con) ex_tvs gammas arg_ids)
     Nothing -> pure (Just nabla) -- Could not guess arg_tys. Just assume inhabited
 
 {- Note [Strict fields and variables of unlifted type]
@@ -836,72 +803,52 @@ lookupSolution nabla x = case vi_pos (lookupVarInfo (nabla_tm_st nabla) x) of
 -- * Adding facts to the oracle
 
 -- | A term constraint.
-data TmCt
-  = TmVarCt     !Id !Id
-  -- ^ @TmVarCt x y@ encodes "x ~ y", equating @x@ and @y@.
-  | TmCoreCt    !Id !CoreExpr
-  -- ^ @TmCoreCt x e@ encodes "x ~ e", equating @x@ with the 'CoreExpr' @e@.
-  | TmConCt     !Id !PmAltCon ![TyVar] ![Id]
-  -- ^ @TmConCt x K tvs ys@ encodes "x ~ K @tvs ys", equating @x@ with the 'PmAltCon'
-  -- application @K @tvs ys@.
-  | TmNotConCt  !Id !PmAltCon
-  -- ^ @TmNotConCt x K@ encodes "x ≁ K", asserting that @x@ can't be headed
+data PhiCt
+  = PhiTyCt !PredType
+  -- ^ A type constraint "T ~ U".
+  | PhiVarCt     !Id !Id
+  -- ^ @PhiVarCt x y@ encodes "x ~ y", equating @x@ and @y@.
+  | PhiCoreCt    !Id !CoreExpr
+  -- ^ @PhiCoreCt x e@ encodes "x ~ e", equating @x@ with the 'CoreExpr' @e@.
+  | PhiConCt     !Id !PmAltCon ![TyVar] ![PredType] ![Id]
+  -- ^ @PhiConCt x K tvs dicts ys@ encodes @K \@tvs dicts ys <- x@, matching @x@
+  -- against the 'PmAltCon' application @K \@tvs dicts ys@, binding @tvs@,
+  -- @dicts@ and possibly unlifted fields @ys@ in the process.
+  -- See Note [Strict fields and fields of unlifted type].
+  | PhiNotConCt  !Id !PmAltCon
+  -- ^ @PhiNotConCt x K@ encodes "x ≁ K", asserting that @x@ can't be headed
   -- by @K@.
-  | TmBotCt     !Id
-  -- ^ @TmBotCt x@ encodes "x ~ ⊥", equating @x@ to ⊥.
+  | PhiBotCt     !Id
+  -- ^ @PhiBotCt x@ encodes "x ~ ⊥", equating @x@ to ⊥.
   -- by @K@.
-  | TmNotBotCt !Id
-  -- ^ @TmNotBotCt x y@ encodes "x ≁ ⊥", asserting that @x@ can't be ⊥.
+  | PhiNotBotCt !Id
+  -- ^ @PhiNotBotCt x y@ encodes "x ≁ ⊥", asserting that @x@ can't be ⊥.
 
-instance Outputable TmCt where
-  ppr (TmVarCt x y)            = ppr x <+> char '~' <+> ppr y
-  ppr (TmCoreCt x e)           = ppr x <+> char '~' <+> ppr e
-  ppr (TmConCt x con tvs args) = ppr x <+> char '~' <+> hsep (ppr con : pp_tvs ++ pp_args)
+instance Outputable PhiCt where
+  ppr (PhiVarCt x y)                  = ppr x <+> char '~' <+> ppr y
+  ppr (PhiCoreCt x e)                 = ppr x <+> char '~' <+> ppr e
+  ppr (PhiConCt x con tvs dicts args) =
+    hsep (ppr con : pp_tvs ++ pp_dicts ++ pp_args) <+> text "<-" <+> ppr x
     where
-      pp_tvs  = map ((<> char '@') . ppr) tvs
-      pp_args = map ppr args
-  ppr (TmNotConCt x con)       = ppr x <+> text "≁" <+> ppr con
-  ppr (TmBotCt x)              = ppr x <+> text "~ ⊥"
-  ppr (TmNotBotCt x)           = ppr x <+> text "≁ ⊥"
+      pp_tvs   = map ((<> char '@') . ppr) tvs
+      pp_dicts = map ppr dicts
+      pp_args  = map ppr args
+  ppr (PhiNotConCt x con)             = ppr x <+> text "≁" <+> ppr con
+  ppr (PhiBotCt x)                    = ppr x <+> text "~ ⊥"
+  ppr (PhiNotBotCt x)                 = ppr x <+> text "≁ ⊥"
 
-type TyCt = PredType
-
--- | An oracle constraint.
-data PmCt
-  = PmTyCt !TyCt
-  -- ^ @PmTy pred_ty@ carries 'PredType's, for example equality constraints.
-  | PmTmCt !TmCt
-  -- ^ A term constraint.
-
-type PmCts = Bag PmCt
-
-pattern PmVarCt :: Id -> Id -> PmCt
-pattern PmVarCt x y            = PmTmCt (TmVarCt x y)
-pattern PmCoreCt :: Id -> CoreExpr -> PmCt
-pattern PmCoreCt x e           = PmTmCt (TmCoreCt x e)
-pattern PmConCt :: Id -> PmAltCon -> [TyVar] -> [Id] -> PmCt
-pattern PmConCt x con tvs args = PmTmCt (TmConCt x con tvs args)
-pattern PmNotConCt :: Id -> PmAltCon -> PmCt
-pattern PmNotConCt x con       = PmTmCt (TmNotConCt x con)
-pattern PmBotCt :: Id -> PmCt
-pattern PmBotCt x              = PmTmCt (TmBotCt x)
-pattern PmNotBotCt :: Id -> PmCt
-pattern PmNotBotCt x           = PmTmCt (TmNotBotCt x)
-{-# COMPLETE PmTyCt, PmVarCt, PmCoreCt, PmConCt, PmNotConCt, PmBotCt, PmNotBotCt #-}
-
-instance Outputable PmCt where
-  ppr (PmTyCt pred_ty) = ppr pred_ty
-  ppr (PmTmCt tm_ct)   = ppr tm_ct
+type PhiCts = Bag PhiCt
 
 -- | Adds new constraints to 'Nabla' and returns 'Nothing' if that leads to a
 -- contradiction.
 --
--- In terms of the paper, this function models the \(⊕_δ\) function in
--- Figure 7.
-addPmCts :: Nabla -> PmCts -> DsM (Maybe Nabla)
+-- In terms of the paper, this function models the \(⊕_φ\) function in
+-- Figure 7 on batches of φ constraints.
+addPhiCts :: Nabla -> PhiCts -> DsM (Maybe Nabla)
 -- See Note [TmState invariants].
-addPmCts nabla cts = runMaybeT $ do
-  nabla' <- addPmCtsNoTest nabla cts
+addPhiCts nabla cts = runMaybeT $ do
+  nabla' <- addPhiCtsNoTest nabla cts
+  -- We need 3 because of T15584
   inhabitationTest 3 (nabla_ty_st nabla) nabla'
 
 -- Why not always perform the inhabitation test immediately after adding type
@@ -920,20 +867,20 @@ addPmCts nabla cts = runMaybeT $ do
 -- So we perform the inhabitation test once after having added all constraints
 -- that we wanted to add.
 
--- | Add 'PmCts' ('addPmCts') without performing an inhabitation test by
+-- | Add 'PmCts' ('addPhiCts') without performing an inhabitation test by
 -- instantiation afterwards. Very much for internal use only!
-addPmCtsNoTest :: Nabla -> PmCts -> MaybeT DsM Nabla
+addPhiCtsNoTest :: Nabla -> PhiCts -> MaybeT DsM Nabla
 -- See Note [TmState invariants].
-addPmCtsNoTest nabla cts = do
-  let (ty_cts, tm_cts) = partitionTyTmCts cts
+addPhiCtsNoTest nabla cts = do
+  let (ty_cts, tm_cts) = partitionPhiCts cts
   nabla' <- addTyCts nabla (listToBag ty_cts)
-  addTmCts nabla' (listToBag tm_cts)
+  foldlM addPhiCt nabla' (listToBag tm_cts)
 
-partitionTyTmCts :: PmCts -> ([TyCt], [TmCt])
-partitionTyTmCts = partitionEithers . map to_either . toList
+partitionPhiCts :: PhiCts -> ([PredType], [PhiCt])
+partitionPhiCts = partitionEithers . map to_either . toList
   where
-    to_either (PmTyCt pred_ty) = Left pred_ty
-    to_either (PmTmCt tm_ct)   = Right tm_ct
+    to_either (PhiTyCt pred_ty) = Left pred_ty
+    to_either ct                = Right ct
 
 -- | Adds new type-level constraints by calling out to the type-checker via
 -- 'tyOracle'.
@@ -942,19 +889,33 @@ addTyCts nabla@MkNabla{ nabla_ty_st = ty_st } new_ty_cs = do
   ty_st' <- MaybeT (tyOracle ty_st new_ty_cs)
   pure nabla{ nabla_ty_st = ty_st' }
 
--- | Adds new term constraints by adding them one by one.
-addTmCts :: Nabla -> Bag TmCt -> MaybeT DsM Nabla
-addTmCts nabla new_tm_cs = foldlM addTmCt nabla new_tm_cs
-
--- | Adds a single term constraint by dispatching to the various term oracle
--- functions.
-addTmCt :: Nabla -> TmCt -> MaybeT DsM Nabla
-addTmCt nabla (TmVarCt x y)            = addVarCt nabla x y
-addTmCt nabla (TmCoreCt x e)           = addCoreCt nabla x e
-addTmCt nabla (TmConCt x con tvs args) = addConCt nabla x con tvs args
-addTmCt nabla (TmNotConCt x con)       = addNotConCt nabla x con
-addTmCt nabla (TmBotCt x)              = addBotCt nabla x
-addTmCt nabla (TmNotBotCt x)           = addNotBotCt nabla x
+-- | Adds a single higher-level φ constraint by dispatching to the various
+-- oracle functions.
+--
+-- In terms of the paper, this function amounts to the constructor constraint
+-- case of \(⊕_φ\) in Figure 7, which "desugars" higher-level φ constraints
+-- into lower-level δ constraints. We don't have a data type for δ constraints
+-- and call the corresponding oracle function directly instead.
+--
+-- Precondition: The φ is not a type constraint! These should be handled by
+-- 'addTyCts' before, through 'addPhiCts'.
+addPhiCt :: Nabla -> PhiCt -> MaybeT DsM Nabla
+addPhiCt _     (PhiTyCt ct)              = pprPanic "addPhiCt:TyCt" (ppr ct) -- See the precondition
+addPhiCt nabla (PhiCoreCt x e)           = addCoreCt nabla x e
+addPhiCt nabla (PhiConCt x con tvs dicts args) = do
+  -- PhiConCt correspond to the higher-level φ constraints from the paper with
+  -- bindings semantics. It disperses into lower-level δ constraints that the
+  -- 'add*Ct' functions correspond to.
+  nabla' <- addTyCts nabla (listToBag dicts)
+  nabla'' <- addConCt nabla' x con tvs args
+  let unlifted_fields =
+        [ arg | (arg, bang) <- zipEqual "addPhiCt" args (pmAltConImplBangs con)
+              , isBanged bang || isUnliftedType (idType arg) ]
+  foldlM addNotBotCt nabla'' unlifted_fields
+addPhiCt nabla (PhiVarCt x y)            = addVarCt nabla x y
+addPhiCt nabla (PhiNotConCt x con)       = addNotConCt nabla x con
+addPhiCt nabla (PhiBotCt x)              = addBotCt nabla x
+addPhiCt nabla (PhiNotBotCt x)           = addNotBotCt nabla x
 
 -- | Adds the constraint @x ~ ⊥@, e.g. that evaluation of a particular 'Id' @x@
 -- surely diverges. Quite similar to 'addConCt', only that it only cares about
@@ -974,32 +935,32 @@ addBotCt nabla@MkNabla{ nabla_tm_st = TmSt env reps } x = do
 -- that leads to a contradiction.
 -- See Note [TmState invariants].
 addNotConCt :: Nabla -> Id -> PmAltCon -> MaybeT DsM Nabla
-addNotConCt _ _ (PmAltConLike (RealDataCon dc))
+addNotConCt _     _ (PmAltConLike (RealDataCon dc))
   | isNewDataCon dc = mzero -- (3) in Note [Coverage checking Newtype matches]
-addNotConCt nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x nalt = do
-  let vi@(VI _ pos neg _ rcm _) = lookupVarInfo ts x
-  -- 1. Bail out quickly when nalt contradicts a solution
-  let contradicts nalt sol = eqPmAltCon (paca_con sol) nalt == Equal
-  guard (not (any (contradicts nalt) pos))
-  -- 2. Only record the new fact when it's not already implied by one of the
-  -- solutions
-  let implies nalt sol = eqPmAltCon (paca_con sol) nalt == Disjoint
-  let neg'
-        | any (implies nalt) pos = neg
-        -- See Note [Completeness checking with required Thetas]
-        | hasRequiredTheta nalt  = neg
-        | otherwise              = extendPmAltConSet neg nalt
-  MASSERT( isPmAltConMatchStrict nalt )
-  let vi1 = vi{ vi_neg = neg', vi_bot = IsNotBot }
-  -- 3. Make sure there's at least one other possible constructor
-  vi2 <- case nalt of
-    PmAltConLike cl -> do
-      -- Mark dirty to force a delayed inhabitation test
-      rcm' <- lift (markMatched cl rcm)
-      pure vi1{ vi_rcm = rcm', vi_dirty = True }
-    _ ->
-      pure vi1
-  pure nabla{ nabla_tm_st = TmSt (setEntrySDIE env x vi2) reps }
+addNotConCt nabla x nalt = overVarInfo go nabla x
+  where
+    go vi@(VI _ pos neg _ rcm _) = do
+      -- 1. Bail out quickly when nalt contradicts a solution
+      let contradicts nalt sol = eqPmAltCon (paca_con sol) nalt == Equal
+      guard (not (any (contradicts nalt) pos))
+      -- 2. Only record the new fact when it's not already implied by one of the
+      -- solutions
+      let implies nalt sol = eqPmAltCon (paca_con sol) nalt == Disjoint
+      let neg'
+            | any (implies nalt) pos = neg
+            -- See Note [Completeness checking with required Thetas]
+            | hasRequiredTheta nalt  = neg
+            | otherwise              = extendPmAltConSet neg nalt
+      MASSERT( isPmAltConMatchStrict nalt )
+      let vi1 = vi{ vi_neg = neg', vi_bot = IsNotBot }
+      -- 3. Make sure there's at least one other possible constructor
+      case nalt of
+        PmAltConLike cl -> do
+          -- Mark dirty to force a delayed inhabitation test
+          rcm' <- lift (markMatched cl rcm)
+          pure vi1{ vi_rcm = rcm', vi_dirty = True }
+        _ ->
+          pure vi1
 
 hasRequiredTheta :: PmAltCon -> Bool
 hasRequiredTheta (PmAltConLike cl) = notNull req_theta
@@ -1100,7 +1061,7 @@ inhabitationTest fuel  old_ty_st nabla@MkNabla{ nabla_tm_st = TmSt env reps} = d
       lift (varNeedsTesting old_ty_st (nabla_ty_st nabla) vi) >>= \case
         True | null (vi_pos vi) -> do
           -- No solution yet and needs testing
-          lift $ tracePm "instantiate one" (ppr vi)
+          trcM "instantiate one" (ppr vi)
           instantiate (fuel-1) nabla vi
         _ -> pure vi
 
@@ -1113,9 +1074,6 @@ inhabitationTest fuel  old_ty_st nabla@MkNabla{ nabla_tm_st = TmSt env reps} = d
 --        to test if unchanged.
 --     4. If all the constructors of a TyCon are vanilla, we don't have to test.
 --        "vanilla" = No strict fields and no Theta.
--- It doesn't need to if it isn't marked dirty because of new negative type
--- constraints /and/ its representation type didn't change compared to the old
--- 'TyState' from the last inhabitation test.
 varNeedsTesting :: TyState -> TyState -> VarInfo -> DsM Bool
 varNeedsTesting _         _         vi
   | vi_dirty vi = pure True
@@ -1156,20 +1114,19 @@ instBot _fuel nabla vi = do
   _nabla' <- addBotCt nabla (vi_id vi)
   pure vi
 
-overVarInfo :: Functor f => (VarInfo -> f (a, VarInfo)) -> Nabla -> Id -> f (a, Nabla)
-overVarInfo f nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x
+trvVarInfo :: Functor f => (VarInfo -> f (a, VarInfo)) -> Nabla -> Id -> f (a, Nabla)
+trvVarInfo f nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x
   = set_vi <$> f (lookupVarInfo ts x)
   where
     set_vi (a, vi') =
       (a, nabla{ nabla_tm_st = TmSt (setEntrySDIE env (vi_id vi') vi') reps })
 
-modifyVarInfo :: (VarInfo -> VarInfo) -> Nabla -> Id -> Nabla
-modifyVarInfo f nabla x = runIdentity $
-  snd <$> overVarInfo (\vi -> pure ((), f vi)) nabla x
+overVarInfo :: Functor f => (VarInfo -> f VarInfo) -> Nabla -> Id -> f Nabla
+overVarInfo f nabla x = snd <$> trvVarInfo (\vi -> ((),) <$> f vi) nabla x
 
 addNormalisedTypeMatches :: Nabla -> Id -> DsM (ResidualCompleteMatches, Nabla)
 addNormalisedTypeMatches nabla@MkNabla{ nabla_ty_st = ty_st } x
-  = overVarInfo add_matches nabla x
+  = trvVarInfo add_matches nabla x
   where
     add_matches vi@VI{ vi_rcm = rcm } = do
       res <- pmTopNormaliseType ty_st (idType x)
@@ -1205,8 +1162,8 @@ anyConLikeSolution p = any (go . paca_con)
     go _                 = False
 
 instCompleteSet :: Int -> Nabla -> Id -> ConLikeSet -> MaybeT DsM Nabla
--- (instCompleteSet nabla vi cs cls) iterates over cls, deleting from cs
--- any uninhabited elements of cls.  Stop (returning Just (nabla', cs))
+-- (instCompleteSet nabla vi cs) iterates over cs, deleting from cs
+-- any uninhabited elements.  Stop (returning (Just nabla'))
 -- when you see an inhabited element; return Nothing if all are uninhabited
 instCompleteSet fuel nabla x cs
   | anyConLikeSolution (`elementOfUniqDSet` cs) (vi_pos vi)
@@ -1234,73 +1191,6 @@ instCompleteSet fuel nabla x cs
           -- We just proved that x can't be con. Encode that fact with addNotConCt.
           nabla' <- addNotConCt nabla x (PmAltConLike con)
           go nabla' cons
-
-
--- | Returns (Just vi) if at least one member of each ConLike in the COMPLETE
--- set satisfies the oracle
---
--- Internally uses and updates the ConLikeSets in vi_rcm.
---
--- NB: Does /not/ filter each ConLikeSet with the oracle; members may
---     remain that do not statisfy it.  This lazy approach just
---     avoids doing unnecessary work.
-ensureInhabited :: Nabla -> VarInfo -> MaybeT DsM VarInfo
-ensureInhabited nabla vi = case vi_bot vi of
-  MaybeBot -> pure vi -- The |-Bot rule from the paper
-  IsBot    -> pure vi
-  IsNotBot -> lift (add_matches vi) >>= inst_complete_sets
-  where
-    add_matches :: VarInfo -> DsM VarInfo
-    add_matches vi = do
-      res <- pmTopNormaliseType (nabla_ty_st nabla) (idType (vi_id vi))
-      rcm <- case reprTyCon_maybe (normalisedSourceType res) of
-        Just tc -> addTyConMatches tc (vi_rcm vi)
-        Nothing -> addCompleteMatches (vi_rcm vi)
-      pure vi{ vi_rcm = rcm }
-
-    reprTyCon_maybe :: Type -> Maybe TyCon
-    reprTyCon_maybe ty = case splitTyConApp_maybe ty of
-      Nothing          -> Nothing
-      Just (tc, _args) -> case tyConFamInst_maybe tc of
-        Nothing          -> Just tc
-        Just (tc_fam, _) -> Just tc_fam
-
-    -- | This is the |-Inst rule from the paper (section 4.5). Tries to
-    -- find an inhabitant in every complete set by instantiating with one their
-    -- constructors. If there is any complete set where we can't find an
-    -- inhabitant, the whole thing is uninhabited.
-    -- See also Note [Implementation of COMPLETE pragmas].
-    inst_complete_sets :: VarInfo -> MaybeT DsM VarInfo
-    inst_complete_sets vi@VI{ vi_rcm = rcm } = do
-      rcm' <- trvRcm (\cls -> inst_complete_set vi cls (uniqDSetToList cls)) rcm
-      pure vi{ vi_rcm = rcm' }
-
-    inst_complete_set :: VarInfo -> ConLikeSet -> [ConLike] -> MaybeT DsM ConLikeSet
-    -- (inst_complete_set cs cls) iterates over cls, deleting from cs
-    -- any uninhabited elements of cls.  Stop (returning Just cs)
-    -- when you see an inhabited element; return Nothing if all
-    -- are uninhabited
-    inst_complete_set _ _  [] = mzero
-    inst_complete_set vi cs (con:cons) = lift (inst_and_test vi con) >>= \case
-      True  -> pure cs
-      False -> inst_complete_set vi (delOneFromUniqDSet cs con) cons
-
-    inst_and_test :: VarInfo -> ConLike -> DsM Bool
-    -- @inst_and_test K@ Returns False if a non-bottom value @v::ty@ cannot possibly
-    -- be of form @K _ _ _@. Returning True is always sound.
-    --
-    -- It's like 'DataCon.dataConCannotMatch', but more clever because it takes
-    -- the facts in Nabla into account.
-    inst_and_test vi con = isJust <$> mkOneConFull nabla (vi_id vi) con
-
--- | Checks if every 'VarInfo' in the term oracle has still an inhabited
--- 'vi_rcm', considering the current type information in 'Nabla'.
--- This check is necessary after having matched on a GADT con to weed out
--- impossible matches.
-ensureAllInhabited :: Nabla -> MaybeT DsM Nabla
-ensureAllInhabited nabla@MkNabla{ nabla_tm_st = TmSt env reps } = do
-  env' <- traverseSDIE (ensureInhabited nabla) env
-  pure nabla{ nabla_tm_st = TmSt env' reps }
 
 --------------------------------------
 -- * Term oracle unification procedure
@@ -1378,8 +1268,8 @@ addConCt nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x alt tvs args = do
       let ty_cts = equateTys (map mkTyVarTy tvs) (map mkTyVarTy other_tvs)
       when (length args /= length other_args) $
         lift $ tracePm "error" (ppr x <+> ppr alt <+> ppr args <+> ppr other_args)
-      let tm_cts = zipWithEqual "addConCt" PmVarCt args other_args
-      addPmCtsNoTest nabla (listToBag ty_cts `unionBags` listToBag tm_cts)
+      let tm_cts = zipWithEqual "addConCt" (\a b -> PhiCoreCt a (Var b)) args other_args
+      addPhiCtsNoTest nabla (listToBag ty_cts `unionBags` listToBag tm_cts)
     Nothing -> do
       let pos' = PACA alt tvs args : pos
       let nabla_with bot' =
@@ -1394,100 +1284,14 @@ addConCt nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x alt tvs args = do
         _ -> ASSERT( isPmAltConMatchStrict alt )
              pure (nabla_with IsNotBot) -- strict match ==> not ⊥
 
-equateTys :: [Type] -> [Type] -> [PmCt]
+equateTys :: [Type] -> [Type] -> [PhiCt]
 equateTys ts us =
-  [ PmTyCt (mkPrimEqPred t u)
+  [ PhiTyCt (mkPrimEqPred t u)
   | (t, u) <- zipEqual "equateTys" ts us
   -- The following line filters out trivial Refl constraints, so that we don't
   -- need to initialise the type oracle that often
   , not (eqType t u)
   ]
-
-----------------------------------------
--- * Enumerating inhabitation candidates
-
--- | Information about a conlike that is relevant to coverage checking.
--- It is called an \"inhabitation candidate\" since it is a value which may
--- possibly inhabit some type, but only if its term constraints ('ic_tm_cs')
--- and type constraints ('ic_ty_cs') are permitting, and if all of its strict
--- argument types ('ic_strict_arg_tys') are inhabitable.
--- See @Note [Strict argument type constraints]@.
--- data InhabitationCandidate =
---   InhabitationCandidate
---   { ic_cs             :: PmCts
---   , ic_strict_arg_tys :: [Type]
---   }
---
--- instance Outputable InhabitationCandidate where
---   ppr (InhabitationCandidate cs strict_arg_tys) =
---     text "InhabitationCandidate" <+>
---       vcat [ text "ic_cs             =" <+> ppr cs
---            , text "ic_strict_arg_tys =" <+> ppr strict_arg_tys ]
---
--- mkInhabitationCandidate :: Id -> DataCon -> DsM InhabitationCandidate
--- -- Precondition: idType x is a TyConApp, so that tyConAppArgs in here is safe.
--- mkInhabitationCandidate x dc = do
---   let cl = RealDataCon dc
---   let tc_args = tyConAppArgs (idType x)
---   (ty_vars, arg_vars, ty_cs, strict_arg_tys) <- mkOneConFull tc_args cl
---   pure InhabitationCandidate
---         { ic_cs = PmTyCt <$> ty_cs `snocBag` PmConCt x (PmAltConLike cl) ty_vars arg_vars
---         , ic_strict_arg_tys = strict_arg_tys
---         }
---
--- -- | Generate all 'InhabitationCandidate's for a given type. The result is
--- -- either @'Left' ty@, if the type cannot be reduced to a closed algebraic type
--- -- (or if it's one trivially inhabited, like 'Int'), or @'Right' candidates@,
--- -- if it can. In this case, the candidates are the signature of the tycon, each
--- -- one accompanied by the term- and type- constraints it gives rise to.
--- -- See also Note [Checking EmptyCase Expressions]
--- inhabitationCandidates :: Nabla -> Type
---                        -> DsM (Either Type (TyCon, Id, [InhabitationCandidate]))
--- inhabitationCandidates MkNabla{ nabla_ty_st = ty_st } ty = do
---   pmTopNormaliseType ty_st ty >>= \case
---     NoChange _                    -> alts_to_check ty     ty      []
---     NormalisedByConstraints ty'   -> alts_to_check ty'    ty'     []
---     HadRedexes src_ty dcs core_ty -> alts_to_check src_ty core_ty dcs
---   where
---     build_newtype :: (Type, DataCon, Type) -> Id -> DsM (Id, PmCt)
---     build_newtype (ty, dc, _arg_ty) x = do
---       -- ty is the type of @dc x@. It's a @dataConTyCon dc@ application.
---       y <- mkPmId ty
---       -- Newtypes don't have existentials (yet?!), so passing an empty list as
---       -- ex_tvs.
---       pure (y, PmConCt y (PmAltConLike (RealDataCon dc)) [] [x])
---
---     build_newtypes :: Id -> [(Type, DataCon, Type)] -> DsM (Id, [PmCt])
---     build_newtypes x = foldrM (\dc (x, cts) -> go dc x cts) (x, [])
---       where
---         go dc x cts = second (:cts) <$> build_newtype dc x
---
---     -- Inhabitation candidates, using the result of pmTopNormaliseType
---     alts_to_check :: Type -> Type -> [(Type, DataCon, Type)]
---                   -> DsM (Either Type (TyCon, Id, [InhabitationCandidate]))
---     alts_to_check src_ty core_ty dcs = case splitTyConApp_maybe core_ty of
---       Just (tc, _)
---         |  isTyConTriviallyInhabited tc
---         -> case dcs of
---              []    -> return (Left src_ty)
---              (_:_) -> do inner <- mkPmId core_ty
---                          (outer, new_tm_cts) <- build_newtypes inner dcs
---                          return $ Right (tc, outer, [InhabitationCandidate
---                            { ic_cs = listToBag new_tm_cts
---                            , ic_strict_arg_tys = [] }])
---
---         |  pmIsClosedType core_ty && not (isAbstractTyCon tc)
---            -- Don't consider abstract tycons since we don't know what their
---            -- constructors are, which makes the results of coverage checking
---            -- them extremely misleading.
---         -> do
---              inner <- mkPmId core_ty -- it would be wrong to unify inner
---              (outer, new_cts) <- build_newtypes inner dcs
---              alts <- mapM (mkInhabitationCandidate inner) (tyConDataCons tc)
---              let wrap_dcs alt = alt{ ic_cs = listToBag new_cts `unionBags` ic_cs alt}
---              return $ Right (tc, outer, map wrap_dcs alts)
---       -- For other types conservatively assume that they are inhabited.
---       _other -> return (Left src_ty)
 
 -- | All these types are trivially inhabited
 triviallyInhabitedTyCons :: UniqSet TyCon
@@ -1600,31 +1404,12 @@ we do the following:
 --     cand_is_inhabitable rec_ts amb_cs
 --       (InhabitationCandidate{ ic_cs             = new_cs
 --                             , ic_strict_arg_tys = new_strict_arg_tys }) = do
---         let (new_ty_cs, new_tm_cs) = partitionTyTmCts new_cs
+--         let (new_ty_cs, new_tm_cs) = partitionPhiCts new_cs
 --         fmap isJust $ runSatisfiabilityCheck amb_cs $ mconcat
 --           [ addTyCts False (listToBag new_ty_cs)
---           , addTmCts (listToBag new_tm_cs)
+--           , addPhiCts (listToBag new_tm_cs)
 --           , tysAreNonVoid rec_ts new_strict_arg_tys
 --           ]
-
--- | @'definitelyInhabitedType' ty@ returns 'True' if @ty@ has at least one
--- constructor @C@ such that:
---
--- 1. @C@ has no equality constraints.
--- 2. @C@ has no strict argument types.
---
--- See the @Note [Strict argument type constraints]@.
-definitelyInhabitedType :: TyState -> Type -> DsM Bool
-definitelyInhabitedType ty_st ty = do
-  res <- pmTopNormaliseType ty_st ty
-  pure $ case res of
-           HadRedexes _ cons _ -> any meets_criteria cons
-           _                   -> False
-  where
-    meets_criteria :: (Type, DataCon, Type) -> Bool
-    meets_criteria (_, con, _) =
-      null (dataConEqSpec con) && -- (1)
-      null (dataConImplBangs con) -- (2)
 
 {- Note [Strict argument type constraints]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1957,6 +1742,9 @@ addCoreCt nabla x e = do
     core_expr x (Cast e _co) = core_expr x e
     core_expr x (Tick _t e) = core_expr x e
     core_expr x e
+      | Var y <- e, Nothing <- isDataConId_maybe x
+      -- We don't consider DataCons flexible variables
+      = modifyT (\nabla -> addVarCt nabla x y)
       | Just (pmLitAsStringLit -> Just s) <- coreExprAsPmLit e
       , expr_ty `eqType` stringTy
       -- See Note [Representation of Strings in TmState]
@@ -2024,7 +1812,7 @@ addCoreCt nabla x e = do
       when (not (isNewDataCon dc)) $
         modifyT $ \nabla -> addNotBotCt nabla x
       -- 2. @a_1 ~ tau_1, ..., a_n ~ tau_n@ for fresh @a_i@. See also #17703
-      modifyT $ \nabla -> addPmCtsNoTest nabla (listToBag ty_cts)
+      modifyT $ \nabla -> addPhiCtsNoTest nabla (listToBag ty_cts)
       -- 3. @y_1 ~ e_1, ..., y_m ~ e_m@ for fresh @y_i@
       arg_ids <- traverse bind_expr vis_args
       -- 4. @x ~ K as ys@
