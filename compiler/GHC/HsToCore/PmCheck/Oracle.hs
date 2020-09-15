@@ -230,7 +230,7 @@ applies due to refined type information.
 -- existential and term binders with fresh variables of appropriate type.
 -- Returns instantiated type and term variables from the match, type evidence
 -- and the types of strict constructor fields.
-mkOneConFull :: Nabla -> Id -> ConLike -> DsM (Maybe Nabla)
+instCon :: Int -> Nabla -> Id -> ConLike -> MaybeT DsM Nabla
 --  * 'con' K is a ConLike
 --       - In the case of DataCons and most PatSynCons, these
 --         are associated with a particular TyCon T
@@ -252,7 +252,7 @@ mkOneConFull :: Nabla -> Id -> ConLike -> DsM (Maybe Nabla)
 --          [y1,..,yn]
 --          Q
 --          [s1]
-mkOneConFull nabla@MkNabla{nabla_ty_st = ty_st} x con = do
+instCon fuel nabla@MkNabla{nabla_ty_st = ty_st} x con = MaybeT $ do
   env <- dsGetFamInstEnvs
   src_ty <- normalisedSourceType <$> pmTopNormaliseType ty_st (idType x)
   let mb_arg_tys = guessConLikeUnivTyArgsFromResTy env src_ty con
@@ -272,15 +272,16 @@ mkOneConFull nabla@MkNabla{nabla_ty_st = ty_st} x con = do
       -- to the type oracle
       let gammas = substTheta subst (eqSpecPreds eq_spec ++ thetas)
       -- Finally add everything to nabla
-      tracePm "mkOneConFull" $ vcat
+      tracePm "instCon" $ vcat
         [ ppr x <+> dcolon <+> ppr (idType x)
         , ppr con <+> dcolon <+> text "... ->" <+> ppr _con_res_ty
         , ppr (zipWith (\tv ty -> ppr tv <+> char '↦' <+> ppr ty) univ_tvs arg_tys)
         , ppr gammas
         , ppr (map (\x -> ppr x <+> dcolon <+> ppr (idType x)) arg_ids)
         ]
-      -- Note that we add a
-      runMaybeT $ addPhiCt nabla (PhiConCt x (PmAltConLike con) ex_tvs gammas arg_ids)
+      runMaybeT $ do
+        nabla' <- addPhiCt nabla (PhiConCt x (PmAltConLike con) ex_tvs gammas arg_ids)
+        inhabitationTest fuel (nabla_ty_st nabla) nabla'
     Nothing -> pure (Just nabla) -- Could not guess arg_tys. Just assume inhabited
 
 {- Note [Strict fields and variables of unlifted type]
@@ -311,7 +312,7 @@ since the forcing happens *before* pattern matching.
       expected.
 
   2.  Similarly, when performing the inhabitation test ('ensureInhabited'),
-      when instantiating a constructor in 'mkOneConFull', we have to generate
+      when instantiating a constructor in 'instCon', we have to generate
       the appropriate unliftedness constraints and hence call 'phiConCts'.
 
   3.  TODO
@@ -586,10 +587,10 @@ tyOracle ty_st@(TySt inert) cts
   = pure (Just ty_st)
   | otherwise
   = do { evs <- traverse nameTyCt cts
-       ; tracePm "tyOracle" (ppr cts)
+       ; tracePm "tyOracle" (ppr cts $$ ppr inert)
        ; ((_warns, errs), res) <- initTcDsForSolver $ tcCheckSatisfiability inert evs
        ; case res of
-            Just mb_new_inert -> return (TySt <$> mb_new_inert)
+            Just mb_new_inert -> tracePm "res" (ppr mb_new_inert) >> return (TySt <$> mb_new_inert)
             Nothing           -> pprPanic "tyOracle" (vcat $ pprErrMsgBagWithLoc errs) }
 
 {- *********************************************************************
@@ -799,15 +800,14 @@ lookupSolution nabla x = case vi_pos (lookupVarInfo (nabla_tm_st nabla) x) of
     | Just sol <- find isDataConSolution pos -> Just sol
     | otherwise                              -> Just (head pos)
 
--------------------------------
--- * Adding facts to the oracle
+-------------------------
+-- * Adding φ constraints
 
--- | A term constraint.
+-- | A high-level pattern-match constraint. Corresponds to φ from Figure 3 of
+-- the LYG paper.
 data PhiCt
   = PhiTyCt !PredType
   -- ^ A type constraint "T ~ U".
-  | PhiVarCt     !Id !Id
-  -- ^ @PhiVarCt x y@ encodes "x ~ y", equating @x@ and @y@.
   | PhiCoreCt    !Id !CoreExpr
   -- ^ @PhiCoreCt x e@ encodes "x ~ e", equating @x@ with the 'CoreExpr' @e@.
   | PhiConCt     !Id !PmAltCon ![TyVar] ![PredType] ![Id]
@@ -825,7 +825,7 @@ data PhiCt
   -- ^ @PhiNotBotCt x y@ encodes "x ≁ ⊥", asserting that @x@ can't be ⊥.
 
 instance Outputable PhiCt where
-  ppr (PhiVarCt x y)                  = ppr x <+> char '~' <+> ppr y
+  ppr (PhiTyCt ty_ct)                 = ppr ty_ct
   ppr (PhiCoreCt x e)                 = ppr x <+> char '~' <+> ppr e
   ppr (PhiConCt x con tvs dicts args) =
     hsep (ppr con : pp_tvs ++ pp_dicts ++ pp_args) <+> text "<-" <+> ppr x
@@ -912,7 +912,6 @@ addPhiCt nabla (PhiConCt x con tvs dicts args) = do
         [ arg | (arg, bang) <- zipEqual "addPhiCt" args (pmAltConImplBangs con)
               , isBanged bang || isUnliftedType (idType arg) ]
   foldlM addNotBotCt nabla'' unlifted_fields
-addPhiCt nabla (PhiVarCt x y)            = addVarCt nabla x y
 addPhiCt nabla (PhiNotConCt x con)       = addNotConCt nabla x con
 addPhiCt nabla (PhiBotCt x)              = addBotCt nabla x
 addPhiCt nabla (PhiNotBotCt x)           = addNotBotCt nabla x
@@ -1152,8 +1151,8 @@ instCompleteSets :: Int -> Nabla -> VarInfo -> MaybeT DsM VarInfo
 instCompleteSets fuel nabla vi = do
   let x = vi_id vi
   (rcm, nabla') <- lift (addNormalisedTypeMatches nabla x)
-  nabla' <- foldM (\nabla cls -> instCompleteSet fuel nabla x cls) nabla' (getRcm rcm)
-  pure (lookupVarInfo (nabla_tm_st nabla') x)
+  nabla'' <- foldM (\nabla cls -> instCompleteSet fuel nabla x cls) nabla' (getRcm rcm)
+  pure (lookupVarInfo (nabla_tm_st nabla'') x)
 
 anyConLikeSolution :: (ConLike -> Bool) -> [PmAltConApp] -> Bool
 anyConLikeSolution p = any (go . paca_con)
@@ -1179,18 +1178,15 @@ instCompleteSet fuel nabla x cs
     go _     []         = mzero
     go nabla (con:cons) = do
       let x = vi_id vi
-      lift (mkOneConFull nabla x con) >>= \case
-        Just nabla' -> do
-          lift $ tracePm "blah" (ppr x $$ ppr con $$ ppr nabla')
-          _nabla' <- inhabitationTest fuel (nabla_ty_st nabla) nabla'
-          -- nabla' is inhabited, which is what we were trying to prove. But
-          -- nabla' is also a possibly proper subset of nabla, so we have to
-          -- return the old nabla and lose all the work we did.
-          pure nabla
-        Nothing     -> do
-          -- We just proved that x can't be con. Encode that fact with addNotConCt.
-          nabla' <- addNotConCt nabla x (PmAltConLike con)
-          go nabla' cons
+      let recur_not_con = do
+            nabla' <- addNotConCt nabla x (PmAltConLike con)
+            go nabla' cons
+      (nabla <$ instCon fuel nabla x con) -- return the original nabla, not the
+                                          -- refined one!
+            <|> recur_not_con -- Assume that x can't be con. Encode that fact
+                              -- with addNotConCt and recur.
+
+
 
 --------------------------------------
 -- * Term oracle unification procedure
@@ -1268,7 +1264,8 @@ addConCt nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x alt tvs args = do
       let ty_cts = equateTys (map mkTyVarTy tvs) (map mkTyVarTy other_tvs)
       when (length args /= length other_args) $
         lift $ tracePm "error" (ppr x <+> ppr alt <+> ppr args <+> ppr other_args)
-      let tm_cts = zipWithEqual "addConCt" (\a b -> PhiCoreCt a (Var b)) args other_args
+      let phi_var_ct a b = PhiCoreCt a (Var b)
+      let tm_cts = zipWithEqual "addConCt" phi_var_ct args other_args
       addPhiCtsNoTest nabla (listToBag ty_cts `unionBags` listToBag tm_cts)
     Nothing -> do
       let pos' = PACA alt tvs args : pos
@@ -1666,30 +1663,23 @@ generateInhabitants (x:xs) n nabla = do
       | fmap (isTyConTriviallyInhabited . fst) (splitTyConApp_maybe ty) == Just True
       = generateInhabitants xs n nabla
     instantiate_cons x ty xs n nabla (cl:cls) = do
-      env <- dsGetFamInstEnvs
-      case guessConLikeUnivTyArgsFromResTy env ty cl of
-        -- Nothing should never happen! This ConLikeSet should have been
-        -- filtered earlier by pickApplicableCompleteSets.
-        Nothing -> pprPanic "instantiate_cons" (ppr ty $$ ppr cl)
-        Just arg_tys -> do
-          mb_nabla <- mkOneConFull nabla x cl
-          -- Now check satifiability
-          tracePm "instantiate_cons" (vcat [ ppr x
-                                           , ppr (idType x)
-                                           , ppr ty
-                                           , ppr cl
-                                           , ppr arg_tys
-                                           , ppr nabla
-                                           , ppr mb_nabla
-                                           , ppr n ])
-          con_nablas <- case mb_nabla of
-            Nothing     -> pure []
-            -- NB: We don't prepend arg_vars as we don't have any evidence on
-            -- them and we only want to split once on a data type. They are
-            -- inhabited, otherwise the inhabitation test would have refuted.
-            Just nabla' -> generateInhabitants xs n nabla'
-          other_cons_nablas <- instantiate_cons x ty xs (n - length con_nablas) nabla cls
-          pure (con_nablas ++ other_cons_nablas)
+      mb_nabla <- runMaybeT $ instCon 3 nabla x cl
+      tracePm "instantiate_cons" (vcat [ ppr x
+                                       , ppr (idType x)
+                                       , ppr ty
+                                       , ppr cl
+                                       , ppr nabla
+                                       , ppr mb_nabla
+                                       , ppr n ])
+
+      con_nablas <- case mb_nabla of
+        Nothing     -> pure []
+        -- NB: We don't prepend arg_vars as we don't have any evidence on
+        -- them and we only want to split once on a data type. They are
+        -- inhabited, otherwise the inhabitation test would have refuted.
+        Just nabla' -> generateInhabitants xs n nabla'
+      other_cons_nablas <- instantiate_cons x ty xs (n - length con_nablas) nabla cls
+      pure (con_nablas ++ other_cons_nablas)
 
 pickApplicableCompleteSets :: Type -> ResidualCompleteMatches -> DsM [ConLikeSet]
 pickApplicableCompleteSets ty rcm = do
@@ -1759,9 +1749,6 @@ addCoreCt nabla x e = do
             <- exprIsConApp_maybe in_scope_env e
       = data_con_app x in_scope dc args
       -- See Note [Detecting pattern synonym applications in expressions]
-      | Var y <- e, Nothing <- isDataConId_maybe x
-      -- We don't consider DataCons flexible variables
-      = modifyT (\nabla -> addVarCt nabla x y)
       | otherwise
       -- Any other expression. Try to find other uses of a semantically
       -- equivalent expression and represent them by the same variable!

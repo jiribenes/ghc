@@ -1229,7 +1229,8 @@ instance OutputableBndrId id => Outputable (HsExprArg id) where
   ppr (HsEPar _)             = text "HsEPar"
   ppr (HsEWrap w)             = case ghcPass @id of
                                     GhcTc -> text "HsEWrap" <+> ppr w
-#if __GLASGOW_HASKELL__ <= 900
+-- TODO: Bump to 900
+#if __GLASGOW_HASKELL__ <= 810
                                     _     -> empty
 #endif
 

@@ -609,9 +609,13 @@ instance Outputable TmState where
 -- | Not user-facing.
 instance Outputable VarInfo where
   ppr (VI x pos neg bot cache dirty)
-    = braces (hcat (punctuate comma [pp_x, ppr pos, ppr neg, ppr bot, ppr cache, pp_dirty]))
+    = braces (hcat (punctuate comma [pp_x, pp_pos, pp_neg, ppr bot, ppr cache, pp_dirty]))
     where
       pp_x = ppr x <> dcolon <> ppr (idType x)
+      pp_pos
+        | [p] <- pos = char '~' <> ppr p -- suppress outer [_] if singleton
+        | otherwise  = char '~' <> ppr pos
+      pp_neg = char '≁' <> ppr neg
       pp_dirty | dirty     = text "dirty"
                | otherwise = empty
 
