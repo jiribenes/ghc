@@ -7,6 +7,7 @@ import GHC.Prelude
 
 import GHC.Types.Unique
 import GHC.Types.Unique.FM
+import GHC.Utils.Outputable
 
 data FuelTank uniq
   = FT
@@ -35,3 +36,6 @@ burnFuel :: Uniquable uniq => FuelTank uniq -> uniq -> FuelBurntResult uniq
 burnFuel (FT init_fuel encounters) u = case lookupUFM encounters u of
   Just fuel_used | fuel_used >= init_fuel -> OutOfFuel
   _ -> FuelLeft (FT init_fuel (addToUFM_C (+) encounters u 1))
+
+instance Outputable (FuelTank u) where
+  ppr (FT init_fuel encounters) = ppr (init_fuel, encounters)

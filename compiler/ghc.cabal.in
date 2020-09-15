@@ -561,7 +561,6 @@ Library
         GHC.Utils.Ppr.Colour
         GHC.Utils.Ppr
         GHC.Utils.Monad.State
-        GHC.Data.ListT
         GHC.Data.Stream
         GHC.Data.StringBuffer
         GHC.Types.Unique.DFM

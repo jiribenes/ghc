@@ -51,7 +51,6 @@ import GHC.Types.Id
 import GHC.Types.Var.Env
 import GHC.Types.Unique.DSet
 import GHC.Types.Unique.DFM
-import GHC.Types.Unique.FuelTank
 import GHC.Types.Name
 import GHC.Core.DataCon
 import GHC.Core.ConLike
@@ -609,9 +608,10 @@ instance Outputable TmState where
 
 -- | Not user-facing.
 instance Outputable VarInfo where
-  ppr (VI ty pos neg bot cache dirty)
-    = braces (hcat (punctuate comma [ppr ty, ppr pos, ppr neg, ppr bot, ppr cache, pp_dirty]))
+  ppr (VI x pos neg bot cache dirty)
+    = braces (hcat (punctuate comma [pp_x, ppr pos, ppr neg, ppr bot, ppr cache, pp_dirty]))
     where
+      pp_x = ppr x <> dcolon <> ppr (idType x)
       pp_dirty | dirty     = text "dirty"
                | otherwise = empty
 
@@ -639,13 +639,11 @@ data Nabla
   -- ^ Type oracle; things like a~Int
   , nabla_tm_st :: !TmState
   -- ^ Term oracle; things like x~Nothing
-  , nabla_fuel  :: !(FuelTank ConLike)
-  -- ^ Fuel for inhabitation test
   }
 
 -- | An initial nabla that is always satisfiable
 initNabla :: Nabla
-initNabla = MkNabla initTyState initTmState (initFuelTank 1)
+initNabla = MkNabla initTyState initTmState
 
 instance Outputable Nabla where
   ppr nabla = hang (text "Nabla") 2 $ vcat [

@@ -45,7 +45,6 @@ import GHC.Types.Unique
 import GHC.Types.Unique.Set
 import GHC.Types.Unique.DSet
 import GHC.Types.Unique.DFM
-import GHC.Types.Unique.FuelTank
 import GHC.Types.Id
 import GHC.Types.Var.Env
 import GHC.Types.Var      (EvVar)
@@ -103,8 +102,8 @@ tracePm herald doc = do
 {-# INLINE tracePm #-}  -- see Note [INLINE conditional tracing utilities]
 
 debugOn :: () -> Bool
-debugOn _ = False
--- debugOn _ = True
+-- debugOn _ = False
+debugOn _ = True
 
 trc :: String -> SDoc -> a -> a
 trc | debugOn () = pprTrace
@@ -250,7 +249,7 @@ applies due to refined type information.
 -- case of \(⊕_φ\) in Figure 7, which "desugars" higher-level φ constraints
 -- into lower-level δ constraints.
 phiConCts :: Id -> PmAltCon -> [TyVar] -> [PredType] -> [Id] -> PmCts
-phiConCts x con tvs dicts args = gammas `unionBags` unlifted `snocBag` con_ct
+phiConCts x con tvs dicts args = (gammas `snocBag` con_ct) `unionBags` unlifted
   where
     gammas   = listToBag $ map PmTyCt dicts
     con_ct   = PmConCt x con tvs args
@@ -259,7 +258,6 @@ phiConCts x con tvs dicts args = gammas `unionBags` unlifted `snocBag` con_ct
                              zipEqual "pmConCts" args (pmAltConImplBangs con)
                          , isBanged bang || isUnliftedType (idType arg)
                          ]
-
 
 -- | Instantiate a 'ConLike' given its universal type arguments. Instantiates
 -- existential and term binders with fresh variables of appropriate type.
@@ -287,11 +285,13 @@ mkOneConFull :: Nabla -> Id -> ConLike -> DsM (Maybe Nabla)
 --          [y1,..,yn]
 --          Q
 --          [s1]
-mkOneConFull nabla x con = do
+mkOneConFull nabla@MkNabla{nabla_ty_st = ty_st} x con = do
   env <- dsGetFamInstEnvs
-  let mb_arg_tys = guessConLikeUnivTyArgsFromResTy env (idType x) con
-  case (mb_arg_tys, burnFuel (nabla_fuel nabla) con) of
-    (Just arg_tys, FuelLeft tank') -> do
+  src_ty <- normalisedSourceType <$> pmTopNormaliseType ty_st (idType x)
+  let mb_arg_tys = guessConLikeUnivTyArgsFromResTy env src_ty con
+  tracePm "guess" (ppr src_ty $$ ppr mb_arg_tys)
+  case mb_arg_tys of
+    Just arg_tys -> do
       let (univ_tvs, ex_tvs, eq_spec, thetas, _req_theta, field_tys, _con_res_ty)
             = conLikeFullSig con
       -- Substitute universals for type arguments
@@ -313,10 +313,8 @@ mkOneConFull nabla x con = do
         , ppr gammas
         , ppr (map (\x -> ppr x <+> dcolon <+> ppr (idType x)) arg_ids)
         ]
-      addPmCts nabla{ nabla_fuel = tank' } $ phiConCts x (PmAltConLike con) ex_tvs gammas arg_ids
-    -- Just assume it's inhabited in the other cases
-    (Just _, OutOfFuel) -> pure (Just nabla) -- Out of fuel
-    (Nothing, _)        -> pure (Just nabla) -- Could not guess arg_tys
+      runMaybeT $ addPmCtsNoTest nabla $ phiConCts x (PmAltConLike con) ex_tvs gammas arg_ids
+    Nothing -> pure (Just nabla) -- Could not guess arg_tys. Just assume inhabited
 
 {- Note [Strict fields and variables of unlifted type]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -904,8 +902,7 @@ addPmCts :: Nabla -> PmCts -> DsM (Maybe Nabla)
 -- See Note [TmState invariants].
 addPmCts nabla cts = runMaybeT $ do
   nabla' <- addPmCtsNoTest nabla cts
-  inhabitationTest 2 (nabla_ty_st nabla) nabla'
-  pure nabla'
+  inhabitationTest 3 (nabla_ty_st nabla) nabla'
 
 -- Why not always perform the inhabitation test immediately after adding type
 -- info? Because of infinite loops. Consider
@@ -1048,8 +1045,7 @@ guessConLikeUnivTyArgsFromResTy :: FamInstEnvs -> Type -> ConLike -> Maybe [Type
 guessConLikeUnivTyArgsFromResTy env res_ty (RealDataCon dc) = do
   (tc, tc_args) <- splitTyConApp_maybe res_ty
   -- Consider data families: In case of a DataCon, we need to translate to
-  -- the representation TyCon. For PatSyns, they are relative to the data
-  -- family TyCon, so we don't need to translate them.
+  -- the representation TyCon.
   let (rep_tc, tc_args', _) = tcLookupDataFamInst env tc tc_args
   if rep_tc == dataConTyCon dc
     then Just tc_args'
@@ -1077,7 +1073,7 @@ addNotBotCt nabla@MkNabla{ nabla_tm_st = TmSt env reps } x = do
     IsNotBot -> pure nabla -- There already is x ≁ ⊥. Nothing left to do
     MaybeBot -> do         -- We add x ≁ ⊥ and test if x is still inhabited
       -- Mark dirty for a delayed inhabitation test
-      let vi' = vi{ vi_bot = IsNotBot, vi_dirty = True }
+      let vi' = vi{ vi_bot = IsNotBot, vi_dirty = True}
       pure nabla{ nabla_tm_st = TmSt (setEntrySDIE env y vi') reps}
 
 -- | Not as unsafe as it looks! Quite a cheap test.
@@ -1087,14 +1083,26 @@ tyStateUnchanged a b = isTrue# (reallyUnsafePtrEquality# a b)
 inhabitationTest :: Int -> TyState -> Nabla -> MaybeT DsM Nabla
 inhabitationTest 0     _         nabla             = pure nabla
 inhabitationTest fuel  old_ty_st nabla@MkNabla{ nabla_tm_st = TmSt env reps} = do
-  env' <- traverseSDIE test_one env
+  lift $ tracePm "inhabitation test" $ vcat
+    [ ppr fuel
+    , ppr old_ty_st
+    , ppr nabla
+    ]
+  -- We have to start the inhabitation test with a Nabla where all dirty bits
+  -- are cleared
+  let clear_dirty vi = pure vi{vi_dirty = False}
+  cleared_env <- traverseSDIE clear_dirty env
+  env' <- traverseSDIE (test_one nabla{ nabla_tm_st = TmSt cleared_env reps }) env
   pure nabla{ nabla_tm_st = TmSt env' reps }
   where
-    test_one :: VarInfo -> MaybeT DsM VarInfo
-    test_one vi =
+    test_one :: Nabla -> VarInfo -> MaybeT DsM VarInfo
+    test_one nabla vi =
       lift (varNeedsTesting old_ty_st (nabla_ty_st nabla) vi) >>= \case
-        True  -> instantiate (fuel-1) nabla vi
-        False -> pure vi
+        True | null (vi_pos vi) -> do
+          -- No solution yet and needs testing
+          lift $ tracePm "instantiate one" (ppr vi)
+          instantiate (fuel-1) nabla vi
+        _ -> pure vi
 
 -- | Checks whether the given 'VarInfo' needs to be tested for inhabitants.
 --
@@ -1104,7 +1112,7 @@ inhabitationTest fuel  old_ty_st nabla@MkNabla{ nabla_tm_st = TmSt env reps} = d
 --     3. If the type state changed, we compare representation types. No need
 --        to test if unchanged.
 --     4. If all the constructors of a TyCon are vanilla, we don't have to test.
---        "vanilla" = No strict fields and not GADT-like.
+--        "vanilla" = No strict fields and no Theta.
 -- It doesn't need to if it isn't marked dirty because of new negative type
 -- constraints /and/ its representation type didn't change compared to the old
 -- 'TyState' from the last inhabitation test.
@@ -1122,8 +1130,7 @@ varNeedsTesting old_ty_st new_ty_st vi = do
     else case splitTyConApp_maybe new_rep_ty of
       Just (tc, _args)
         | Just dcs <- tyConDataCons_maybe tc
-        , lengthAtMost dcs 10
-        -> pure (any non_vanilla_dc dcs)
+        -> pure (atLength (any non_vanilla_dc) True dcs 10)
       _ -> pure True
   where
     non_vanilla_dc :: DataCon -> Bool
@@ -1147,7 +1154,7 @@ instantiate fuel nabla vi = instBot fuel nabla vi <|> instCompleteSets fuel nabl
 instBot :: Int -> Nabla -> VarInfo -> MaybeT DsM VarInfo
 instBot _fuel nabla vi = do
   _nabla' <- addBotCt nabla (vi_id vi)
-  pure vi{vi_dirty = False} -- We just found an inhabitant! Not dirty anymore.
+  pure vi
 
 overVarInfo :: Functor f => (VarInfo -> f (a, VarInfo)) -> Nabla -> Id -> f (a, Nabla)
 overVarInfo f nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x
@@ -1217,11 +1224,12 @@ instCompleteSet fuel nabla x cs
       let x = vi_id vi
       lift (mkOneConFull nabla x con) >>= \case
         Just nabla' -> do
+          lift $ tracePm "blah" (ppr x $$ ppr con $$ ppr nabla')
           _nabla' <- inhabitationTest fuel (nabla_ty_st nabla) nabla'
           -- nabla' is inhabited, which is what we were trying to prove. But
           -- nabla' is also a possibly proper subset of nabla, so we have to
           -- return the old nabla and lose all the work we did.
-          pure $ modifyVarInfo (\vi -> vi{vi_dirty = False}) nabla x
+          pure nabla
         Nothing     -> do
           -- We just proved that x can't be con. Encode that fact with addNotConCt.
           nabla' <- addNotConCt nabla x (PmAltConLike con)
@@ -1371,7 +1379,7 @@ addConCt nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x alt tvs args = do
       when (length args /= length other_args) $
         lift $ tracePm "error" (ppr x <+> ppr alt <+> ppr args <+> ppr other_args)
       let tm_cts = zipWithEqual "addConCt" PmVarCt args other_args
-      MaybeT $ addPmCts nabla (listToBag ty_cts `unionBags` listToBag tm_cts)
+      addPmCtsNoTest nabla (listToBag ty_cts `unionBags` listToBag tm_cts)
     Nothing -> do
       let pos' = PACA alt tvs args : pos
       let nabla_with bot' =
@@ -1824,7 +1832,6 @@ generateInhabitants (x:xs) n nabla = do
       -> generateInhabitants xs n nabla
     [] -> try_instantiate x xs n nabla
   where
-
     -- | Tries to instantiate a variable by possibly following the chain of
     -- newtypes and then instantiating to all ConLikes of the wrapped type's
     -- minimal residual COMPLETE set.
@@ -1894,7 +1901,7 @@ generateInhabitants (x:xs) n nabla = do
             Nothing     -> pure []
             -- NB: We don't prepend arg_vars as we don't have any evidence on
             -- them and we only want to split once on a data type. They are
-            -- inhabited, otherwise pmIsSatisfiable would have refuted.
+            -- inhabited, otherwise the inhabitation test would have refuted.
             Just nabla' -> generateInhabitants xs n nabla'
           other_cons_nablas <- instantiate_cons x ty xs (n - length con_nablas) nabla cls
           pure (con_nablas ++ other_cons_nablas)
@@ -2017,7 +2024,7 @@ addCoreCt nabla x e = do
       when (not (isNewDataCon dc)) $
         modifyT $ \nabla -> addNotBotCt nabla x
       -- 2. @a_1 ~ tau_1, ..., a_n ~ tau_n@ for fresh @a_i@. See also #17703
-      modifyT $ \nabla -> MaybeT $ addPmCts nabla (listToBag ty_cts)
+      modifyT $ \nabla -> addPmCtsNoTest nabla (listToBag ty_cts)
       -- 3. @y_1 ~ e_1, ..., y_m ~ e_m@ for fresh @y_i@
       arg_ids <- traverse bind_expr vis_args
       -- 4. @x ~ K as ys@
