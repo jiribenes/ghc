@@ -839,6 +839,11 @@ instance Outputable PhiCt where
 
 type PhiCts = Bag PhiCt
 
+-- | The fuel for the inhabitation test.
+-- See Note [Fuel for the inhabitation test].
+initFuel :: Int
+initFuel = 4 -- 4 because it's the smallest number that passes f' in T17977b
+
 -- | Adds new constraints to 'Nabla' and returns 'Nothing' if that leads to a
 -- contradiction.
 --
@@ -848,8 +853,7 @@ addPhiCts :: Nabla -> PhiCts -> DsM (Maybe Nabla)
 -- See Note [TmState invariants].
 addPhiCts nabla cts = runMaybeT $ do
   nabla' <- addPhiCtsNoTest nabla cts
-  -- We need 3 because of T15584
-  inhabitationTest 3 (nabla_ty_st nabla) nabla'
+  inhabitationTest initFuel (nabla_ty_st nabla) nabla'
 
 -- Why not always perform the inhabitation test immediately after adding type
 -- info? Because of infinite loops. Consider
@@ -1264,9 +1268,9 @@ addConCt nabla@MkNabla{ nabla_tm_st = ts@(TmSt env reps) } x alt tvs args = do
       let ty_cts = equateTys (map mkTyVarTy tvs) (map mkTyVarTy other_tvs)
       when (length args /= length other_args) $
         lift $ tracePm "error" (ppr x <+> ppr alt <+> ppr args <+> ppr other_args)
-      let phi_var_ct a b = PhiCoreCt a (Var b)
-      let tm_cts = zipWithEqual "addConCt" phi_var_ct args other_args
-      addPhiCtsNoTest nabla (listToBag ty_cts `unionBags` listToBag tm_cts)
+      nabla' <- addPhiCtsNoTest nabla (listToBag ty_cts)
+      let add_var_ct nabla (a, b) = addVarCt nabla a b
+      foldlM add_var_ct nabla' $ zipEqual "addConCt" args other_args
     Nothing -> do
       let pos' = PACA alt tvs args : pos
       let nabla_with bot' =
@@ -1338,76 +1342,6 @@ we do the following:
      pattern match checking.
 -}
 
--- -- | A 'SatisfiabilityCheck' based on "NonVoid ty" constraints, e.g. Will
--- -- check if the @strict_arg_tys@ are actually all inhabited.
--- -- Returns the old 'Nabla' if all the types are non-void according to 'Nabla'.
--- tysAreNonVoid :: RecTcChecker -> [Type] -> SatisfiabilityCheck
--- tysAreNonVoid rec_env strict_arg_tys = SC $ \nabla -> do
---   all_non_void <- checkAllNonVoid rec_env nabla strict_arg_tys
---   -- Check if each strict argument type is inhabitable
---   pure $ if all_non_void
---             then Just nabla
---             else Nothing
---
--- -- | Implements two performance optimizations, as described in
--- -- @Note [Strict argument type constraints]@.
--- checkAllNonVoid :: RecTcChecker -> Nabla -> [Type] -> DsM Bool
--- checkAllNonVoid rec_ts amb_cs strict_arg_tys = do
---   let definitely_inhabited = definitelyInhabitedType (nabla_ty_st amb_cs)
---   tys_to_check <- filterOutM definitely_inhabited strict_arg_tys
---   -- See Note [Fuel for the inhabitation test]
---   let rec_max_bound | tys_to_check `lengthExceeds` 1
---                     = 1
---                     | otherwise
---                     = 3
---       rec_ts' = setRecTcMaxBound rec_max_bound rec_ts
---   allM (nonVoid rec_ts' amb_cs) tys_to_check
---
--- -- | Checks if a strict argument type of a conlike is inhabitable by a
--- -- terminating value (i.e, an 'InhabitationCandidate').
--- -- See @Note [Strict argument type constraints]@.
--- nonVoid
---   :: RecTcChecker -- ^ The per-'TyCon' recursion depth limit.
---   -> Nabla        -- ^ The ambient term/type constraints (known to be
---                   --   satisfiable).
---   -> Type         -- ^ The strict argument type.
---   -> DsM Bool     -- ^ 'True' if the strict argument type might be inhabited by
---                   --   a terminating value (i.e., an 'InhabitationCandidate').
---                   --   'False' if it is definitely uninhabitable by anything
---                   --   (except bottom).
--- nonVoid rec_ts amb_cs strict_arg_ty = do
---   mb_cands <- inhabitationCandidates amb_cs strict_arg_ty
---   case mb_cands of
---     Right (tc, _, cands)
---       -- See Note [Fuel for the inhabitation test]
---       |  Just rec_ts' <- checkRecTc rec_ts tc
---       -> anyM (cand_is_inhabitable rec_ts' amb_cs) cands
---            -- A strict argument type is inhabitable by a terminating value if
---            -- at least one InhabitationCandidate is inhabitable.
---     _ -> pure True
---            -- Either the type is trivially inhabited or we have exceeded the
---            -- recursion depth for some TyCon (so bail out and conservatively
---            -- claim the type is inhabited).
---   where
---     -- Checks if an InhabitationCandidate for a strict argument type:
---     --
---     -- (1) Has satisfiable term and type constraints.
---     -- (2) Has 'nonVoid' strict argument types (we bail out of this
---     --     check if recursion is detected).
---     --
---     -- See Note [Strict argument type constraints]
---     cand_is_inhabitable :: RecTcChecker -> Nabla
---                         -> InhabitationCandidate -> DsM Bool
---     cand_is_inhabitable rec_ts amb_cs
---       (InhabitationCandidate{ ic_cs             = new_cs
---                             , ic_strict_arg_tys = new_strict_arg_tys }) = do
---         let (new_ty_cs, new_tm_cs) = partitionPhiCts new_cs
---         fmap isJust $ runSatisfiabilityCheck amb_cs $ mconcat
---           [ addTyCts False (listToBag new_ty_cs)
---           , addPhiCts (listToBag new_tm_cs)
---           , tysAreNonVoid rec_ts new_strict_arg_tys
---           ]
-
 {- Note [Strict argument type constraints]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 In the ConVar case of clause processing, each conlike K traditionally
@@ -1473,8 +1407,8 @@ We call this the "inhabitation test".
 Note [Fuel for the inhabitation test]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Whether or not a type is inhabited is undecidable in general. As a result, we
-can run into infinite loops in `nonVoid`. Therefore, we adopt a fuel-based
-approach to prevent that.
+can run into infinite loops in `inhabitationTest`. Therefore, we adopt a
+fuel-based approach to prevent that.
 
 Consider the following example:
 
@@ -1483,12 +1417,12 @@ Consider the following example:
   stareIntoTheAbyss x = case x of {}
 
 In principle, stareIntoTheAbyss is exhaustive, since there is no way to
-construct a terminating value using MkAbyss. However, both the term and type
-constraints for MkAbyss are satisfiable, so the only way one could determine
-that MkAbyss is unreachable is to check if `nonVoid Abyss` returns False.
-There is only one InhabitationCandidate for Abyss—MkAbyss—and both its term
-and type constraints are satisfiable, so we'd need to check if `nonVoid Abyss`
-returns False... and now we've entered an infinite loop!
+construct a terminating value using MkAbyss. But this can't be proven by mere
+instantiation and requires an inductive argument, which `inhabitationTest`
+currently isn't equipped to do.
+
+In order to prevent endless instantiation attempts in @inhabitationTest@, we use
+the fuel as an upper bound such attempts.
 
 To avoid this sort of conundrum, `nonVoid` uses a simple test to detect the
 presence of recursive types (through `checkRecTc`), and if recursion is
@@ -1663,7 +1597,7 @@ generateInhabitants (x:xs) n nabla = do
       | fmap (isTyConTriviallyInhabited . fst) (splitTyConApp_maybe ty) == Just True
       = generateInhabitants xs n nabla
     instantiate_cons x ty xs n nabla (cl:cls) = do
-      mb_nabla <- runMaybeT $ instCon 3 nabla x cl
+      mb_nabla <- runMaybeT $ instCon 4 nabla x cl
       tracePm "instantiate_cons" (vcat [ ppr x
                                        , ppr (idType x)
                                        , ppr ty
@@ -1718,7 +1652,7 @@ addCoreCt :: Nabla -> Id -> CoreExpr -> MaybeT DsM Nabla
 addCoreCt nabla x e = do
   simpl_opts <- initSimpleOpts <$> getDynFlags
   let e' = simpleOptExpr simpl_opts e
-  -- lift $ tracePm "addCoreCt" (ppr x <+> dcolon <+> ppr (idType x) $$ ppr e $$ ppr e')
+  lift $ tracePm "addCoreCt" (ppr x <+> dcolon <+> ppr (idType x) $$ ppr e $$ ppr e')
   execStateT (core_expr x e') nabla
   where
     -- | Takes apart a 'CoreExpr' and tries to extract as much information about
@@ -1732,9 +1666,6 @@ addCoreCt nabla x e = do
     core_expr x (Cast e _co) = core_expr x e
     core_expr x (Tick _t e) = core_expr x e
     core_expr x e
-      | Var y <- e, Nothing <- isDataConId_maybe x
-      -- We don't consider DataCons flexible variables
-      = modifyT (\nabla -> addVarCt nabla x y)
       | Just (pmLitAsStringLit -> Just s) <- coreExprAsPmLit e
       , expr_ty `eqType` stringTy
       -- See Note [Representation of Strings in TmState]
@@ -1749,6 +1680,9 @@ addCoreCt nabla x e = do
             <- exprIsConApp_maybe in_scope_env e
       = data_con_app x in_scope dc args
       -- See Note [Detecting pattern synonym applications in expressions]
+      | Var y <- e, Nothing <- isDataConId_maybe x
+      -- We don't consider DataCons flexible variables
+      = modifyT (\nabla -> addVarCt nabla x y)
       | otherwise
       -- Any other expression. Try to find other uses of a semantically
       -- equivalent expression and represent them by the same variable!
