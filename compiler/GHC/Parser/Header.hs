@@ -47,11 +47,13 @@ import GHC.Utils.Monad
 import GHC.Utils.Exception as Exception
 import GHC.Types.Basic
 import qualified GHC.LanguageExtensions as LangExt
+import GHC.OldList (find)
 
 import Control.Monad
 import System.IO
 import System.IO.Unsafe
 import Data.List
+import Data.Char (toLower)
 
 ------------------------------------------------------------------------------
 
@@ -312,12 +314,13 @@ checkExtension :: DynFlags -> Located FastString -> Located String
 checkExtension dflags (L l ext)
 -- Checks if a given extension is valid, and if so returns
 -- its corresponding flag. Otherwise it throws an exception.
-  = if ext' `elem` supported
-    then L l ("-X"++ext')
-    else unsupportedExtnError dflags l ext'
+  = case filter (\(a, b) -> a == map toLower ext') supported' of
+      [(_, ext'')] -> L l ("-X" ++ ext'')
+      _ -> unsupportedExtnError dflags l ext'
   where
     ext' = unpackFS ext
     supported = supportedLanguagesAndExtensions $ platformArchOS $ targetPlatform dflags
+    supported' = map (\x -> (map toLower x, x)) supported
 
 languagePragParseError :: DynFlags -> SrcSpan -> a
 languagePragParseError dflags loc =
